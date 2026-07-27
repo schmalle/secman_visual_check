@@ -1,0 +1,26 @@
+[
+  {
+    "id": "customer_data",
+    "title": "Customer records",
+    "description": "Customer names, order history, addresses or support tickets visible without logging in.",
+    "default_severity": "critical"
+  },
+  {
+    "id": "unreleased_pricing",
+    "title": "Unreleased pricing or roadmap",
+    "description": "Price lists, discount tiers or roadmap items that have not been announced publicly.",
+    "default_severity": "high"
+  },
+  {
+    "id": "staging_marker",
+    "title": "Staging or pre-production marker",
+    "description": "Staging banners, test data, lorem ipsum or 'do not use' notices on a production hostname.",
+    "default_severity": "medium"
+  },
+  {
+    "id": "third_party_widget",
+    "title": "Unexpected third-party widget",
+    "description": "Chat widgets, trackers or ad units that are not part of the approved vendor list.",
+    "default_severity": "low"
+  }
+]

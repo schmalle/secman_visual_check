@@ -1,0 +1,7 @@
+# One URL per line. Blank lines and #-comments are ignored.
+# A missing scheme defaults to https://.
+
+example.com
+https://example.com/admin          # inline comments work too
+https://example.com/backup/
+http://legacy.example.com:8080/status

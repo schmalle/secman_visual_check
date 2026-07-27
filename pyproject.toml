@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "secman-visual-check"
+version = "0.1.0"
+description = "Screenshot URLs with a headless browser and check them for exposed critical content using a vision model."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.44",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+secman-visual-check = "secman_visual_check.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["secman_visual_check*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
