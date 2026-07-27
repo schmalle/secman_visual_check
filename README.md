@@ -7,7 +7,9 @@ takes a screenshot, and asks a vision model whether the page exposes content
 that should not be reachable — credentials, unauthenticated admin panels,
 directory listings, personal data, stack traces, and so on. You get a console
 summary, a machine-readable JSON report, and a self-contained HTML report with
-the screenshots embedded.
+the screenshots embedded. Findings can also be pushed straight into
+[SecMan](https://github.com/schmalle/secman) — see
+[Uploading findings to SecMan](#uploading-findings-to-secman).
 
 > **Scan only systems you own or are explicitly authorised to test.** The tool
 > loads pages and sends screenshots to a third-party model provider; both are
@@ -154,6 +156,70 @@ python -m secman_visual_check -f targets.txt --fail-on critical --quiet
 Use `--fail-on none` to always exit `0`, and `--dry-run` to print the resolved,
 de-duplicated target list without touching the network.
 
+## Uploading findings to SecMan
+
+Findings can be pushed straight into a [SecMan](https://github.com/schmalle/secman)
+instance, over its REST API or its MCP endpoint:
+
+```bash
+# Show what would be uploaded — no credentials, no network, no writes
+python -m secman_visual_check --secman-upload --secman-dry-run https://example.com
+
+# Scan and upload over the REST API
+export SECMAN_URL=https://secman.internal
+export SECMAN_USERNAME=scanner-bot SECMAN_PASSWORD=...
+python -m secman_visual_check --secman-upload -f targets.txt
+
+# Same, over MCP
+export SECMAN_MCP_API_KEY=sk-... SECMAN_MCP_USER_EMAIL=you@company.com
+python -m secman_visual_check --secman-upload --secman-transport mcp -f targets.txt
+
+# Upload a report from an earlier run, without rescanning
+python -m secman_visual_check --secman-upload-report scan-output/report.json
+```
+
+Each finding becomes a vulnerability on the asset named after the target's host,
+under a synthetic ID derived from the page and the finding's category:
+
+```
+SECMAN-VISUAL-EXPOSED-CREDENTIALS-90eb9ade62
+```
+
+That ID is deliberately independent of the model's wording, which is rephrased on
+every run. Scanning the same page twice therefore lands on the same ID, and
+**duplicates are suppressed in three layers**: findings that collapse to one SecMan
+row are merged before sending, findings SecMan already holds are skipped, and
+anything that still arrives hits SecMan's own `(asset, cve)` upsert. A failure of
+the middle layer is reported and non-fatal — the upsert still prevents duplication.
+
+`--secman-dry-run` writes nothing. Without credentials it goes fully offline and
+just prints the payloads; with credentials it still performs the read-only
+existence check, so it can tell you which findings are already there. Credentials
+are validated *before* the scan starts, so a typo fails immediately rather than
+after a long crawl.
+
+Severity maps onto SecMan's four levels (`info` folds into `LOW`), and
+`--secman-min-severity` (default `medium`) decides what is worth uploading at all.
+
+| Flag | Effect |
+| --- | --- |
+| `--secman-upload`, `--secman-upload-report PATH` | Upload this scan, or an earlier `report.json` |
+| `--secman-dry-run` | Print the payloads, write nothing |
+| `--secman-transport {http,mcp}` | REST API (default) or MCP endpoint |
+| `--secman-url`, `--secman-timeout`, `--secman-insecure` | Where SecMan is and how to reach it |
+| `--secman-token` / `--secman-username`+`--secman-password` | http auth: an existing JWT, or a login |
+| `--secman-api-key`, `--secman-user-email` | mcp auth: `X-MCP-API-Key` and `X-MCP-User-Email` |
+| `--secman-min-severity`, `--secman-owner`, `--secman-id-prefix`, `--secman-asset-name` | How findings are mapped |
+| `--secman-allow-existing` | Re-send findings SecMan already holds |
+| `--secman-fail-on-error` | Exit non-zero when an upload fails |
+
+Environment defaults: `SECMAN_URL`, `SECMAN_TOKEN`, `SECMAN_USERNAME`,
+`SECMAN_PASSWORD`, `SECMAN_MCP_API_KEY`, `SECMAN_MCP_USER_EMAIL`. Note that
+`SECMAN_API_KEY` is the *vision model's* key and is not used for uploads.
+
+Full reference, including the ID scheme, the permissions each transport needs and
+troubleshooting: [docs/SECMAN_UPLOAD.md](docs/SECMAN_UPLOAD.md).
+
 ## Options worth knowing
 
 | Flag | Effect |
@@ -218,6 +284,7 @@ only rendered the browser's own error screen is never sent to the model.
 | `analyzer.py` | OpenAI-compatible vision call, retries, lenient JSON parsing |
 | `scanner.py` | Pipelines capture → analysis with independent concurrency limits |
 | `reporting.py` | Console, JSON and HTML output |
+| `secman.py` | Maps findings onto SecMan vulnerabilities; HTTP and MCP upload |
 | `cli.py` | Argument parsing and exit codes |
 
 ## Caveats
@@ -239,5 +306,7 @@ python -m pytest
 
 The suite covers URL handling, prompt construction, the model-response parser,
 the analyzer's HTTP behaviour (retries, schema downgrade, auth failures) against
-a mocked transport, scanner orchestration, and report rendering. It does not
-require a browser or an API key.
+a mocked transport, scanner orchestration, report rendering, and the SecMan
+upload — ID stability, the three de-duplication layers, dry-run behaviour, and
+both transports against a mocked backend. It does not require a browser, an API
+key or a SecMan instance.
