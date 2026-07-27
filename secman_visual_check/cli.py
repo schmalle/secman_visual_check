@@ -21,6 +21,17 @@ from .reporting import (
     write_json_report,
 )
 from .scanner import run_scan
+from .secman import (
+    DEFAULT_BACKEND_URL,
+    DEFAULT_ID_PREFIX,
+    DEFAULT_OWNER,
+    DEFAULT_TIMEOUT_S,
+    SecmanError,
+    SecmanOptions,
+    load_report_json,
+    upload_findings,
+    write_upload_report,
+)
 from .targets import TargetError, load_targets
 
 EXIT_OK = 0
@@ -209,6 +220,115 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit 1 when a finding at this severity or above exists (default: %(default)s)",
     )
     run.add_argument("--dry-run", action="store_true", help="print the resolved targets and exit")
+
+    secman = parser.add_argument_group(
+        "secman upload",
+        "Push findings into a SecMan instance (https://github.com/schmalle/secman). "
+        "Findings become vulnerabilities on the asset named after the target's host, "
+        "under a stable synthetic ID, so re-scanning updates rows instead of "
+        "duplicating them.",
+    )
+    secman.add_argument(
+        "--secman-upload",
+        action="store_true",
+        help="upload this scan's findings to SecMan when it finishes",
+    )
+    secman.add_argument(
+        "--secman-upload-report",
+        metavar="PATH",
+        help="upload the findings of an existing report.json and exit (no scan)",
+    )
+    secman.add_argument(
+        "--secman-dry-run",
+        action="store_true",
+        help="show exactly what would be uploaded without writing anything",
+    )
+    secman.add_argument(
+        "--secman-transport",
+        choices=("http", "mcp"),
+        default="http",
+        help="REST API or MCP endpoint (default: %(default)s)",
+    )
+    secman.add_argument(
+        "--secman-url",
+        default=None,
+        metavar="URL",
+        help=f"SecMan base URL (default: $SECMAN_URL or {DEFAULT_BACKEND_URL})",
+    )
+    secman.add_argument(
+        "--secman-token",
+        default=None,
+        metavar="JWT",
+        help="existing SecMan JWT for http transport (default: $SECMAN_TOKEN)",
+    )
+    secman.add_argument(
+        "--secman-username",
+        default=None,
+        help="SecMan login for http transport (default: $SECMAN_USERNAME)",
+    )
+    secman.add_argument(
+        "--secman-password",
+        default=None,
+        help="SecMan password for http transport (default: $SECMAN_PASSWORD)",
+    )
+    secman.add_argument(
+        "--secman-api-key",
+        default=None,
+        metavar="KEY",
+        help="MCP API key, sent as X-MCP-API-Key (default: $SECMAN_MCP_API_KEY)",
+    )
+    secman.add_argument(
+        "--secman-user-email",
+        default=None,
+        metavar="EMAIL",
+        help="MCP delegated user, sent as X-MCP-User-Email (default: $SECMAN_MCP_USER_EMAIL)",
+    )
+    secman.add_argument(
+        "--secman-min-severity",
+        choices=("critical", "high", "medium", "low", "info"),
+        default="medium",
+        help="lowest severity worth uploading (default: %(default)s)",
+    )
+    secman.add_argument(
+        "--secman-owner",
+        default=DEFAULT_OWNER,
+        metavar="NAME",
+        help="owner recorded on assets SecMan auto-creates (default: %(default)s)",
+    )
+    secman.add_argument(
+        "--secman-id-prefix",
+        default=DEFAULT_ID_PREFIX,
+        metavar="PREFIX",
+        help="prefix for the synthetic vulnerability IDs (default: %(default)s)",
+    )
+    secman.add_argument(
+        "--secman-asset-name",
+        default=None,
+        metavar="NAME",
+        help="file every finding under this asset instead of the target's hostname",
+    )
+    secman.add_argument(
+        "--secman-allow-existing",
+        action="store_true",
+        help="re-send findings SecMan already holds instead of skipping them",
+    )
+    secman.add_argument(
+        "--secman-timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_S,
+        metavar="SECONDS",
+        help="SecMan request timeout (default: %(default)s)",
+    )
+    secman.add_argument(
+        "--secman-insecure",
+        action="store_true",
+        help="ignore TLS certificate errors when talking to SecMan",
+    )
+    secman.add_argument(
+        "--secman-fail-on-error",
+        action="store_true",
+        help="exit non-zero when any finding could not be uploaded",
+    )
     return parser
 
 
@@ -309,6 +429,43 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
     )
 
 
+def build_secman_options(args: argparse.Namespace) -> SecmanOptions:
+    """Resolve the SecMan flags against the environment, raising ValueError if unusable."""
+    options = SecmanOptions(
+        transport=args.secman_transport,
+        base_url=(args.secman_url or os.environ.get("SECMAN_URL") or DEFAULT_BACKEND_URL),
+        dry_run=args.secman_dry_run,
+        token=args.secman_token or os.environ.get("SECMAN_TOKEN"),
+        username=args.secman_username or os.environ.get("SECMAN_USERNAME"),
+        password=args.secman_password or os.environ.get("SECMAN_PASSWORD"),
+        # Deliberately not SECMAN_API_KEY: that one is the vision model's key.
+        api_key=args.secman_api_key or os.environ.get("SECMAN_MCP_API_KEY"),
+        user_email=args.secman_user_email or os.environ.get("SECMAN_MCP_USER_EMAIL"),
+        min_severity=Severity(args.secman_min_severity),
+        owner=args.secman_owner,
+        id_prefix=args.secman_id_prefix,
+        asset_name=args.secman_asset_name,
+        allow_existing=args.secman_allow_existing,
+        timeout=args.secman_timeout,
+        verify_tls=not args.secman_insecure,
+    )
+    options.validate()
+    return options
+
+
+def _run_secman_upload(report, options: SecmanOptions, fail_on_error: bool) -> int:
+    """Upload a report's findings and turn the result into an exit code."""
+    try:
+        summary = upload_findings(report, options)
+    except SecmanError as exc:
+        print(f"error: SecMan upload failed: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    write_upload_report(summary)
+    if summary.failures and fail_on_error:
+        return EXIT_ERROR
+    return EXIT_OK
+
+
 def _progress_hook(quiet: bool):
     def hook(result: ScanResult, done: int, total: int) -> None:
         if quiet:
@@ -329,6 +486,28 @@ def _progress_hook(quiet: bool):
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    upload_requested = args.secman_upload or args.secman_upload_report
+    if upload_requested:
+        try:
+            secman_options = build_secman_options(args)
+        except ValueError as exc:
+            # Fail before the scan: a ten-minute crawl should not end on a typo
+            # in the credentials.
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+    else:
+        secman_options = None
+
+    # Uploading a stored report is a standalone mode; there is nothing to scan.
+    if args.secman_upload_report:
+        try:
+            stored = load_report_json(args.secman_upload_report)
+        except SecmanError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        assert secman_options is not None
+        return _run_secman_upload(stored, secman_options, args.secman_fail_on_error)
 
     if not args.urls and not args.file and not args.stdin:
         parser.error("no targets given; pass URLs, --file PATH or --stdin")
@@ -396,10 +575,16 @@ def main(argv: list[str] | None = None) -> int:
         write_html_report(report, path, embed_images=not args.link_images)
         print(f"HTML report: {path}")
 
+    upload_status = EXIT_OK
+    if secman_options is not None:
+        upload_status = _run_secman_upload(
+            report, secman_options, args.secman_fail_on_error
+        )
+
     if config.fail_on is not None and report.max_severity.rank >= config.fail_on.rank:
         if any(f.severity.rank >= config.fail_on.rank for r in report.results for f in r.findings):
             return EXIT_FINDINGS
-    return EXIT_OK
+    return upload_status
 
 
 if __name__ == "__main__":  # pragma: no cover
