@@ -44,8 +44,10 @@ class StatusCheckOptions:
     expect_statuses: tuple[int, ...] = DEFAULT_EXPECT
     max_concurrency: int = DEFAULT_CONCURRENCY
     #: Hash the response body of targets that answer as expected, so a later run
-    #: can tell "still up" from "still up and unchanged".
-    checksum: bool = False
+    #: can tell "still up" from "still up and unchanged". On by default: it costs
+    #: one extra GET per healthy target, and a status check that cannot tell you
+    #: the content changed is answering a less useful question.
+    checksum: bool = True
     checksum_max_bytes: int = DEFAULT_CHECKSUM_MAX_BYTES
     user_agent: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)

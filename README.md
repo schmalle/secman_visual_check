@@ -22,6 +22,8 @@ results can be mirrored into MariaDB, see [db/README.md](db/README.md).
 
 ## Install
 
+Python 3.10+.
+
 ```bash
 pip install -r requirements.txt
 playwright install chromium          # one-time browser download
@@ -34,7 +36,50 @@ pip install -e .
 playwright install chromium
 ```
 
-Python 3.10+.
+### Homebrew Python (macOS)
+
+Homebrew's Python is an *externally managed* environment ([PEP 668](https://peps.python.org/pep-0668/)),
+so a bare `pip install` into it is refused:
+
+```
+error: externally-managed-environment
+× This environment is externally managed
+```
+
+Use a virtual environment. This is the recommended setup on macOS:
+
+```bash
+brew install python              # if you do not already have it
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/playwright install chromium
+```
+
+Then run the tool through that interpreter — either directly, or with the venv
+activated:
+
+```bash
+.venv/bin/python -m secman_visual_check https://example.com
+
+# …or activate once per shell and drop the prefix
+source .venv/bin/activate
+python -m secman_visual_check https://example.com
+```
+
+Installing the package (`pip install -e .`) additionally puts a
+`secman-visual-check` command on the venv's path, so `.venv/bin/secman-visual-check`
+works without the `-m` form.
+
+Two Homebrew-specific notes:
+
+- **Do not** reach for `pip install --break-system-packages`. It writes into the
+  interpreter Homebrew manages, and a later `brew upgrade python` can remove or
+  replace what you installed.
+- Chromium is downloaded by `playwright install` into `~/Library/Caches/ms-playwright`,
+  not by Homebrew, and it is tied to the Playwright version in the venv. Re-run
+  `playwright install chromium` after upgrading Playwright. To use a browser you
+  already have instead, point `$SECMAN_BROWSER_EXECUTABLE` at it — or skip the
+  browser entirely with `--no-visual-check`.
 
 ## Quick start
 
@@ -70,9 +115,139 @@ Output lands in `scan-output/` by default:
 ```
 scan-output/
 ├── screenshots/0001-example.com-admin-3f9a2c1b04.png
-├── report.json
-└── report.html
+├── report.json        machine-readable, the full detail
+├── report.html        self-contained, screenshots embedded
+├── report.csv         one row per target, for a spreadsheet
+└── statistics.txt     the aggregate numbers
 ```
+
+All four are written by default; `--no-json`, `--no-html`, `--no-csv` and
+`--no-stats` each drop one, and `--json`, `--html`, `--csv` and `--stats` take an
+explicit path.
+
+## Reports
+
+### CSV
+
+`report.csv` is **one row per target**, not per finding — a target is the unit
+you sort, filter and assign, and the row is still complete when a run produced
+no findings at all:
+
+| column | |
+| --- | --- |
+| `url` | the target as scanned |
+| `status_state`, `status_ok`, `first_status`, `final_status`, `final_url`, `redirect_count` | the HTTP status check |
+| `content_checksum`, `content_length`, `content_type` | the body hash, when one was taken |
+| `http_status`, `title`, `screenshot` | what the browser saw, blank under `--no-visual-check` |
+| `max_severity`, `findings`, `categories` | the verdict: worst severity, how many findings, and the distinct categories, `;`-separated |
+| `page_type`, `summary` | the model's description of the page |
+| `error` | load error, scan error, or `robots.txt` skip reason |
+
+Cells beginning `=`, `+`, `-` or `@` are prefixed with `'`, so a page title or a
+model summary cannot become a live formula when the file is opened in Excel or
+LibreOffice.
+
+### Statistics
+
+The aggregate numbers are printed at the end of every run and written to
+`statistics.txt`:
+
+```
+Statistics:
+  targets                    4
+  findings                   0  on 0 target(s)
+  answering as expected      2   50.0%
+  checksummed                2   50.0%  891.1 KB hashed
+```
+
+The console block shows what the two count tables above it do not; the file adds
+the full per-severity and per-state breakdown with percentages, plus the run's
+timing, version and model. Rows for a stage that never ran are omitted rather
+than printed as zeros — a `--no-visual-check` run says nothing about captures,
+because "0 captured" would read as failure rather than as *not applicable*.
+
+`--no-stats` suppresses both the file and the console block.
+
+## Doing less: `--no-ai` and `--no-visual-check`
+
+A full run does three things per target: an HTTP status check, a screenshot, and
+a model call. Two flags switch the expensive halves off, and they stack from the
+outside in:
+
+| Mode | Status check | Screenshot | Model call | Needs |
+| --- | --- | --- | --- | --- |
+| default | yes | yes | yes | Chromium + API key |
+| `--no-ai` | yes | yes | no | Chromium |
+| `--no-visual-check` | yes | no | no | neither |
+
+`--no-status-check` turns off the remaining probe; combining it with
+`--no-visual-check` leaves nothing to do and is rejected with exit code `2`.
+
+### `--no-ai` — screenshots without a verdict
+
+Captures every page and writes the reports, but never calls the model. No API
+key is needed, nothing leaves the machine, and the run costs nothing:
+
+```bash
+python -m secman_visual_check --no-ai -f examples/urls.txt -o ./evidence
+```
+
+```
+Scanning 12 target(s) with 4 browser worker(s); analysis: capture only
+
+[INFO] https://example.com/backup/
+  status: 200 ok  (0.12s)
+  HTTP 200  title='Index of /backup'
+  screenshot: evidence/screenshots/0002-example.com-backup-3f9a2c1b04.png
+```
+
+Results carry `analysis: null` in `report.json`, and the HTML report is a
+screenshot contact sheet. Use it to grab evidence for a human to review, to
+sanity-check `--viewport`, `--max-height` or `--storage-state` before paying for
+a real run, or in CI where an API key is not available.
+
+Because there are no findings, `--fail-on` can never trip — pair it with
+`--fail-on-status` if you still want the run to gate:
+
+```bash
+python -m secman_visual_check --no-ai --fail-on-status -f targets.txt --quiet
+```
+
+### `--no-visual-check` — no browser at all
+
+Skips the Chromium *launch*, not just the screenshot, so this works on a host
+where Playwright's browser was never installed — a small CI image, a container,
+a jump host:
+
+```bash
+python -m secman_visual_check --no-visual-check -f examples/urls.txt
+```
+
+```
+Scanning 12 target(s) with 8 status worker(s); analysis: no browser (status check only)
+
+[INFO] https://example.com/admin
+  status: 200 ok  (0.06s)
+```
+
+What remains is a fast uptime and redirect checker. It fans out over
+`--status-concurrency` (8 by default, independent of `-c`) and finishes a
+few hundred URLs in seconds. Typical uses:
+
+```bash
+# Uptime gate: fail the pipeline when anything stops answering as expected
+python -m secman_visual_check --no-visual-check --fail-on-status -f targets.txt
+
+# Change detection: mirror the body hashes into MariaDB
+python -m secman_visual_check --no-visual-check --db-store -f targets.txt
+
+# Redirect audit: record the first response verbatim and do not follow it
+python -m secman_visual_check --no-visual-check --status-max-redirects 0 -f targets.txt
+```
+
+`capture` and `analysis` are both `null` in `report.json`; `status_check` is
+fully populated. Screenshots are absent, so `--link-images` and `--include-raw`
+have nothing to act on.
 
 ## Status and redirect checks
 
@@ -124,8 +299,8 @@ python -m secman_visual_check --no-status-check https://example.com
 
 ### Content checksums
 
-`--status-checksum` hashes the body of every target that answers as expected, so
-a later run can tell *still up* from *still up and unchanged*:
+**On by default.** Every target that answers as expected has its body hashed
+with sha256, so a later run can tell *still up* from *still up and unchanged*:
 
 ```
 [INFO] https://example.com/admin
@@ -134,18 +309,31 @@ a later run can tell *still up* from *still up and unchanged*:
 ```
 
 Only healthy targets are hashed — a 404's error page changes for reasons nobody
-wants to be alerted about. Bodies are streamed and capped at
-`--status-checksum-max-bytes` (5 MiB), and `--db-store` turns this on for you,
-since the stored checksum is what makes change detection possible.
+wants to be alerted about. Bodies are streamed, never buffered whole, and capped
+at `--status-checksum-max-bytes` (5 MiB).
+
+The cost is one extra `GET` per healthy target, since the walk itself only needs
+`HEAD`. That is real: a 900 KB homepage takes roughly 0.2s to hash where the
+bare status check took 0.05s. Turn it off when you only care whether a target
+answers:
+
+```bash
+python -m secman_visual_check --no-status-checksum -f urls.txt
+```
+
+`--no-status-checksum` cannot be combined with `--db-store` — the stored
+checksum is what drives change detection and the `NEW`/`OK` flag lifecycle, so
+the combination is rejected with exit code `2` rather than silently storing
+nothing. `--status-checksum` still exists and is now a no-op, so existing
+scripts and cron entries keep working.
 
 ### Skipping the browser
 
-`--no-visual-check` skips Chromium entirely — no screenshots, no model calls.
-What remains is a fast status and checksum checker that runs anywhere, with no
-browser installed:
+`--no-visual-check` reduces a run to exactly this check — no Chromium, no model
+calls. See [Doing less](#doing-less---no-ai-and---no-visual-check).
 
 ```bash
-python -m secman_visual_check --no-visual-check --status-checksum -f urls.txt
+python -m secman_visual_check --no-visual-check -f urls.txt
 ```
 
 Full reference: [docs/STATUS_CHECK.md](docs/STATUS_CHECK.md).
@@ -378,11 +566,12 @@ troubleshooting: [docs/SECMAN_UPLOAD.md](docs/SECMAN_UPLOAD.md).
 | `--timeout`, `--wait-until`, `--settle` | Navigation budget, completion signal, and extra settle time for lazy content. |
 | `--insecure` | Ignore TLS certificate errors (common on internal hosts). |
 | `--respect-robots` | Skip URLs the origin's `robots.txt` disallows. Off by default: you are scanning your own assets. |
+| `--no-json`, `--no-html`, `--no-csv`, `--no-stats` | Drop one of the four default reports. `--json/--html/--csv/--stats PATH` relocate them. |
 | `--link-images` | Link screenshots from the HTML report instead of embedding them, for large scans. |
 | `--include-raw` | Keep the raw model replies in the JSON report, for debugging prompts. |
 | `--no-visual-check` | Skip the browser entirely: no screenshots, no model calls, no Chromium needed. |
 | `--no-status-check` | Skip the HTTP status/redirect pre-check. |
-| `--status-checksum`, `--status-checksum-max-bytes` | Hash the body of healthy targets so changes are detectable between runs. |
+| `--no-status-checksum`, `--status-checksum-max-bytes` | Body hashing of healthy targets is on by default; turn it off, or cap how much of a body is read. |
 | `--status-expect 200,401`, `--status-max-redirects`, `--status-method`, `--status-timeout`, `--status-concurrency` | Tune the status check. See [docs/STATUS_CHECK.md](docs/STATUS_CHECK.md). |
 | `--fail-on-status` | Exit 1 when any target's status check is not OK. |
 | `--db-store`, `--db-url`, `--db-*` | Mirror the status results into MariaDB. See [db/README.md](db/README.md). |
@@ -465,7 +654,7 @@ target was skipped by `robots.txt`.
 | `prompts.py` | System prompt, user prompt, and the response JSON schema |
 | `analyzer.py` | OpenAI-compatible vision call, retries, lenient JSON parsing |
 | `scanner.py` | Pipelines capture → analysis with independent concurrency limits |
-| `reporting.py` | Console, JSON and HTML output |
+| `reporting.py` | Console, JSON, HTML, CSV and statistics output |
 | `secman.py` | Maps findings onto SecMan vulnerabilities; HTTP and MCP upload |
 | `db.py` | Optional MariaDB mirror: status history, URL flags, change tracking |
 | `mailer.py` | Result email over SMTP, Microsoft 365 or AWS SES |

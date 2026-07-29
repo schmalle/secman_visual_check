@@ -215,7 +215,9 @@ def test_head_falls_back_to_get_when_the_server_refuses_head():
             return httpx.Response(405)
         return httpx.Response(200)
 
-    status = run_check(handler)
+    # checksum=False so the assertion sees the walk alone: an enabled checksum
+    # appends its own body GET to every healthy target.
+    status = run_check(handler, checksum=False)
 
     assert seen == ["HEAD", "GET"]
     assert status.method == "GET"
@@ -229,7 +231,7 @@ def test_method_get_never_issues_a_head():
         seen.append(request.method)
         return httpx.Response(200)
 
-    status = run_check(handler, method="get")
+    status = run_check(handler, method="get", checksum=False)
 
     assert seen == ["GET"]
     assert status.method == "GET"
@@ -386,11 +388,31 @@ def body_responder(body, status_code=200, content_type="text/html"):
     return handler
 
 
-def test_no_checksum_is_computed_unless_asked():
+def test_checksum_is_computed_by_default():
     status = run_check(body_responder(b"<h1>hi</h1>"))
+
+    assert status.content_checksum is not None
+    assert status.content_length == len(b"<h1>hi</h1>")
+
+
+def test_no_checksum_is_computed_when_turned_off():
+    status = run_check(body_responder(b"<h1>hi</h1>"), checksum=False)
 
     assert status.content_checksum is None
     assert status.content_length is None
+
+
+def test_turning_the_checksum_off_issues_no_body_request():
+    """The point of --no-status-checksum is the saved bandwidth, not just the field."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        return httpx.Response(200, content=b"<h1>hi</h1>")
+
+    run_check(handler, checksum=False)
+
+    assert seen == ["HEAD"]
 
 
 def test_checksum_hashes_the_body_of_a_healthy_target():

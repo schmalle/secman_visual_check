@@ -391,12 +391,22 @@ def test_skipping_both_checks_exits_before_scanning(capsys):
 # --------------------------------------------------------------------------- #
 
 
-def test_checksum_is_off_by_default_and_opt_in(tmp_path):
-    off = build_config(parse(["https://example.com", "-o", str(tmp_path)]))
-    on = build_config(parse(["https://example.com", "--status-checksum", "-o", str(tmp_path)]))
+def test_checksum_is_on_by_default_and_can_be_turned_off(tmp_path):
+    on = build_config(parse(["https://example.com", "-o", str(tmp_path)]))
+    off = build_config(
+        parse(["https://example.com", "--no-status-checksum", "-o", str(tmp_path)])
+    )
 
-    assert off.status_check.checksum is False
     assert on.status_check.checksum is True
+    assert off.status_check.checksum is False
+
+
+def test_status_checksum_flag_still_accepted(tmp_path):
+    """Kept as a no-op so existing scripts and cron entries do not break."""
+    config = build_config(
+        parse(["https://example.com", "--status-checksum", "-o", str(tmp_path)])
+    )
+    assert config.status_check.checksum is True
 
 
 def test_database_mode_implies_the_checksum(tmp_path):
@@ -404,6 +414,108 @@ def test_database_mode_implies_the_checksum(tmp_path):
         parse(["https://example.com", "--db-store", "--db-user", "u", "-o", str(tmp_path)])
     )
     assert config.status_check.checksum is True
+
+
+def test_disabling_the_checksum_conflicts_with_database_mode(tmp_path):
+    with pytest.raises(ValueError, match="change detection"):
+        build_config(
+            parse(
+                [
+                    "https://example.com",
+                    "--db-store",
+                    "--db-user",
+                    "u",
+                    "--no-status-checksum",
+                    "-o",
+                    str(tmp_path),
+                ]
+            )
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Report files
+# --------------------------------------------------------------------------- #
+
+
+def _stub_scan(monkeypatch):
+    """Run main() without a browser, a model or the network."""
+    from secman_visual_check.models import ScanReport
+
+    async def fake_run_scan(targets, config, progress=None, tool_version=""):
+        report = ScanReport(model="test/model", tool_version=tool_version)
+        report.results = [
+            ScanResult(
+                url=url,
+                status_check=UrlStatus(
+                    url=url, state="ok", method="HEAD", first_status=200, final_status=200
+                ),
+            )
+            for url in targets
+        ]
+        return report
+
+    monkeypatch.setattr("secman_visual_check.cli.run_scan", fake_run_scan)
+
+
+def test_all_four_reports_are_written_by_default(tmp_path, monkeypatch):
+    _stub_scan(monkeypatch)
+
+    code = main(["https://example.com", "--no-visual-check", "-o", str(tmp_path)])
+
+    assert code == 0
+    assert (tmp_path / "report.json").is_file()
+    assert (tmp_path / "report.html").is_file()
+    assert (tmp_path / "report.csv").is_file()
+    assert (tmp_path / "statistics.txt").is_file()
+
+
+def test_each_report_can_be_skipped(tmp_path, monkeypatch):
+    _stub_scan(monkeypatch)
+
+    main(
+        [
+            "https://example.com",
+            "--no-visual-check",
+            "--no-json",
+            "--no-html",
+            "--no-csv",
+            "--no-stats",
+            "-o",
+            str(tmp_path),
+        ]
+    )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_report_paths_are_overridable(tmp_path, monkeypatch):
+    _stub_scan(monkeypatch)
+
+    main(
+        [
+            "https://example.com",
+            "--no-visual-check",
+            "--csv",
+            str(tmp_path / "targets.csv"),
+            "--stats",
+            str(tmp_path / "summary.txt"),
+            "-o",
+            str(tmp_path),
+        ]
+    )
+
+    assert (tmp_path / "targets.csv").is_file()
+    assert (tmp_path / "summary.txt").is_file()
+    assert not (tmp_path / "report.csv").exists()
+
+
+def test_no_status_check_leaves_no_checksum(tmp_path):
+    """The body fetch hangs off the status check; without it there is nothing."""
+    config = build_config(
+        parse(["https://example.com", "--no-status-check", "-o", str(tmp_path)])
+    )
+    assert config.status_check.enabled is False
 
 
 def test_checksum_cap_is_configurable(tmp_path):

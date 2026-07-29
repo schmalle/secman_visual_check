@@ -1,13 +1,14 @@
-"""Console, JSON and HTML rendering of a ScanReport."""
+"""Console, JSON, HTML, CSV and statistics rendering of a ScanReport."""
 
 from __future__ import annotations
 
 import base64
+import csv
 import html
 import json
 import sys
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 from .models import STATUS_STATES, ScanReport, ScanResult, Severity, UrlStatus
 
@@ -124,6 +125,7 @@ def write_console_report(
     stream: TextIO | None = None,
     color: bool | None = None,
     verbose: bool = False,
+    statistics: bool = True,
 ) -> None:
     out = stream or sys.stdout
     use_color = should_colorize(out, color)
@@ -148,6 +150,9 @@ def write_console_report(
     if report.status_checked:
         _write_status_summary(report, out, use_color)
 
+    if statistics:
+        _write_statistics_summary(report, out)
+
     failures = report.failed
     if failures:
         print("", file=out)
@@ -155,6 +160,77 @@ def write_console_report(
         for result in failures:
             reason = result.error or (result.capture.load_error if result.capture else "unknown")
             print(f"  {result.url} — {reason}", file=out)
+
+
+def _write_statistics_summary(report: ScanReport, out: TextIO) -> None:
+    """The derived numbers, deliberately not repeating the two count tables above.
+
+    Rows whose stage never ran are omitted rather than printed as zeros: a
+    ``--no-visual-check`` run has nothing to say about captures.
+    """
+    stats = report_statistics(report)
+    targets = stats["targets"]
+    if not targets:
+        return
+
+    rows: list[tuple[str, str]] = [("targets", f"{targets:>6}")]
+
+    if any(r.capture is not None for r in report.results):
+        rows.append(("captured", f"{stats['captured']:>6}  {_pct(stats['captured'], targets)}"))
+        if stats["capture_failed"]:
+            rows.append(
+                ("capture failed", f"{stats['capture_failed']:>6}  {_pct(stats['capture_failed'], targets)}")
+            )
+        if stats["analysed"]:
+            rows.append(("analysed", f"{stats['analysed']:>6}  {_pct(stats['analysed'], targets)}"))
+    if stats["skipped"]:
+        rows.append(("skipped", f"{stats['skipped']:>6}  {_pct(stats['skipped'], targets)}"))
+
+    rows.append(
+        (
+            "findings",
+            f"{stats['findings_total']:>6}  on {stats['targets_with_findings']} target(s)",
+        )
+    )
+
+    checked = stats["status_checked"]
+    if checked:
+        rows.append(
+            ("answered HTTP 200", f"{stats['answered_200']:>6}  {_pct(stats['answered_200'], checked)}")
+        )
+        rows.append(
+            (
+                "answered another code",
+                f"{stats['answered_other']:>6}  {_pct(stats['answered_other'], checked)}",
+            )
+        )
+        if stats["no_response"]:
+            rows.append(
+                ("no response", f"{stats['no_response']:>6}  {_pct(stats['no_response'], checked)}")
+            )
+        # Only worth a line when it differs from the plain 200 count above, which
+        # happens exactly when --status-expect was widened.
+        if stats["status_ok"] != stats["answered_200"]:
+            rows.append(
+                (
+                    "answering as expected",
+                    f"{stats['status_ok']:>6}  {_pct(stats['status_ok'], checked)}",
+                )
+            )
+        if stats["checksummed"]:
+            rows.append(
+                (
+                    "checksummed",
+                    f"{stats['checksummed']:>6}  {_pct(stats['checksummed'], checked)}"
+                    f"  {human_bytes(stats['bytes_hashed'])} hashed",
+                )
+            )
+
+    print("", file=out)
+    print("Statistics:", file=out)
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        print(f"  {label:<{width}} {value}", file=out)
 
 
 def _write_status_summary(report: ScanReport, out: TextIO, use_color: bool) -> None:
@@ -165,6 +241,15 @@ def _write_status_summary(report: ScanReport, out: TextIO, use_color: bool) -> N
         count = counts.get(state, 0)
         label = f"  {state:<18} {count}"
         print(_paint_status(label, state, use_color) if count else label, file=out)
+
+    # The states bucket by kind; this says which code was actually returned.
+    code_rows = sorted_code_counts(report.status_code_counts())
+    if code_rows:
+        checked = sum(count for _, count in code_rows)
+        print("", file=out)
+        print("HTTP status codes:", file=out)
+        for code, count in code_rows:
+            print(f"  {code_label(code):<18} {count:>6}  {_pct(count, checked)}", file=out)
 
     problems = report.status_failures
     if not problems:
@@ -253,6 +338,239 @@ def write_json_report(report: ScanReport, path: Path, include_raw: bool = False)
 def write_html_report(report: ScanReport, path: Path, embed_images: bool = True) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_html(report, path.parent, embed_images), encoding="utf-8")
+    return path
+
+
+#: One row per target, so a status-only run (no capture, no analysis) is still a
+#: full table. Findings are summarised rather than exploded into rows: a target
+#: is the unit an operator sorts, filters and assigns.
+CSV_COLUMNS = (
+    "url",
+    "status_state",
+    "status_ok",
+    "first_status",
+    "final_status",
+    "final_url",
+    "redirect_count",
+    "content_checksum",
+    "content_length",
+    "content_type",
+    "http_status",
+    "title",
+    "screenshot",
+    "max_severity",
+    "findings",
+    "categories",
+    "page_type",
+    "summary",
+    "error",
+)
+
+#: Excel and LibreOffice evaluate a cell starting with any of these. Page titles
+#: and model summaries are attacker-influenced text, so they are quoted out.
+_FORMULA_LEADERS = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    text = str(value)
+    if text.startswith(_FORMULA_LEADERS):
+        return "'" + text
+    return text
+
+
+def csv_rows(report: ScanReport) -> list[dict[str, str]]:
+    """One dict per target, keyed by :data:`CSV_COLUMNS`."""
+    rows = []
+    for result in report.results:
+        status = result.status_check
+        capture = result.capture
+        analysis = result.analysis
+        findings = result.findings
+        error = result.error or result.skipped_reason or (
+            capture.load_error if capture else None
+        )
+        row = {
+            "url": result.url,
+            "status_state": status.state if status else None,
+            "status_ok": status.ok if status else None,
+            "first_status": status.first_status if status else None,
+            "final_status": status.final_status if status else None,
+            "final_url": status.final_url if status else None,
+            "redirect_count": status.redirect_count if status else None,
+            "content_checksum": status.content_checksum if status else None,
+            "content_length": status.content_length if status else None,
+            "content_type": status.content_type if status else None,
+            "http_status": capture.status if capture else None,
+            "title": capture.title if capture else None,
+            "screenshot": capture.screenshot_path if capture else None,
+            "max_severity": result.max_severity.value,
+            "findings": len(findings),
+            "categories": ";".join(sorted({f.category for f in findings})),
+            "page_type": analysis.page_type if analysis else None,
+            "summary": analysis.summary if analysis else None,
+            "error": error,
+        }
+        rows.append({key: _csv_cell(value) for key, value in row.items()})
+    return rows
+
+
+def write_csv_report(report: ScanReport, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # newline="" per the csv module: it writes \r\n itself.
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+        writer.writerows(csv_rows(report))
+    return path
+
+
+def sorted_code_counts(counts: dict[str, int]) -> list[tuple[str, int]]:
+    """Numerically ascending, with the no-response bucket last."""
+    codes = sorted((c for c in counts if c != "none"), key=int)
+    rows = [(code, counts[code]) for code in codes]
+    if counts.get("none"):
+        rows.append(("none", counts["none"]))
+    return rows
+
+
+def code_label(code: str) -> str:
+    return "no response" if code == "none" else f"HTTP {code}"
+
+
+def report_statistics(report: ScanReport) -> dict[str, Any]:
+    """Aggregate counts for the statistics report, and for anything else that asks."""
+    checksummed = 0
+    bytes_hashed = 0
+    status_ok = 0
+    for result in report.results:
+        status = result.status_check
+        if status is None:
+            continue
+        if status.ok:
+            status_ok += 1
+        if status.content_checksum:
+            checksummed += 1
+            bytes_hashed += status.content_length or 0
+
+    checked = sum(1 for r in report.results if r.status_check is not None)
+    code_counts = report.status_code_counts()
+    # Split on the literal code, not on the ``ok`` state: --status-expect can
+    # make a 401 "expected", and the question here is what the server said.
+    answered_200 = code_counts.get("200", 0)
+    no_response = code_counts.get("none", 0)
+    return {
+        "tool_version": report.tool_version,
+        "model": report.model,
+        "started_at": report.started_at,
+        "finished_at": report.finished_at,
+        "duration_s": report.duration_s,
+        "targets": len(report.results),
+        "captured": sum(1 for r in report.results if r.capture and r.capture.ok),
+        "capture_failed": len(report.failed),
+        "skipped": sum(1 for r in report.results if r.skipped_reason),
+        "analysed": sum(1 for r in report.results if r.analysis is not None),
+        "targets_with_findings": sum(1 for r in report.results if r.findings),
+        "findings_total": sum(len(r.findings) for r in report.results),
+        "severity_counts": report.severity_counts(),
+        "max_severity": report.max_severity.value,
+        "status_checked": checked,
+        "status_ok": status_ok,
+        "status_failed": len(report.status_failures),
+        "status_counts": report.status_counts(),
+        "status_code_counts": code_counts,
+        "answered_200": answered_200,
+        "answered_other": checked - answered_200 - no_response,
+        "no_response": no_response,
+        "checksummed": checksummed,
+        "bytes_hashed": bytes_hashed,
+    }
+
+
+def _pct(count: int, total: int) -> str:
+    """A percentage column, blank when there is nothing to divide by."""
+    if not total:
+        return ""
+    return f"{count * 100.0 / total:5.1f}%"
+
+
+def render_stats(report: ScanReport) -> str:
+    stats = report_statistics(report)
+    targets = stats["targets"]
+    lines = [
+        "secman_visual_check — scan statistics",
+        "=" * 44,
+        "",
+        f"Started    {stats['started_at'].isoformat()}",
+    ]
+    if stats["finished_at"]:
+        lines.append(f"Finished   {stats['finished_at'].isoformat()}")
+    lines.append(f"Duration   {stats['duration_s']:.1f}s")
+    if stats["tool_version"]:
+        lines.append(f"Version    {stats['tool_version']}")
+    if stats["model"]:
+        lines.append(f"Model      {stats['model']}")
+    lines += ["", f"Targets    {targets}"]
+
+    # Omitted entirely for --no-visual-check: four zero rows about a stage that
+    # never ran read as "everything failed" rather than "not applicable".
+    if any(r.capture is not None for r in report.results):
+        lines += [
+            "",
+            "Capture",
+            f"  captured          {stats['captured']:>6}  {_pct(stats['captured'], targets)}",
+            f"  failed            {stats['capture_failed']:>6}  {_pct(stats['capture_failed'], targets)}",
+            f"  skipped           {stats['skipped']:>6}  {_pct(stats['skipped'], targets)}",
+            f"  analysed          {stats['analysed']:>6}  {_pct(stats['analysed'], targets)}",
+        ]
+
+    lines += ["", "Findings by severity"]
+    for severity in reversed(list(Severity)):
+        count = stats["severity_counts"][severity.value]
+        lines.append(f"  {severity.value:<17} {count:>6}")
+    lines += [
+        f"  {'total':<17} {stats['findings_total']:>6}",
+        "",
+        f"  targets with findings {stats['targets_with_findings']:>2}  "
+        f"{_pct(stats['targets_with_findings'], targets)}",
+        f"  highest severity      {stats['max_severity']}",
+    ]
+
+    if stats["status_checked"]:
+        checked = stats["status_checked"]
+        lines += ["", "Status checks"]
+        for state in STATUS_DISPLAY_ORDER:
+            count = stats["status_counts"].get(state, 0)
+            lines.append(f"  {state:<17} {count:>6}  {_pct(count, checked)}")
+        lines.append(f"  {'checked':<17} {checked:>6}")
+
+        lines += ["", "HTTP status codes"]
+        for code, count in sorted_code_counts(stats["status_code_counts"]):
+            lines.append(f"  {code_label(code):<17} {count:>6}  {_pct(count, checked)}")
+        lines += [
+            "",
+            f"  answered HTTP 200     {stats['answered_200']:>2}  "
+            f"{_pct(stats['answered_200'], checked)}",
+            f"  answered another code {stats['answered_other']:>2}  "
+            f"{_pct(stats['answered_other'], checked)}",
+            f"  no response           {stats['no_response']:>2}  "
+            f"{_pct(stats['no_response'], checked)}",
+            f"  answering as expected {stats['status_ok']:>2}  "
+            f"{_pct(stats['status_ok'], checked)}",
+            f"  checksummed           {stats['checksummed']:>2}  "
+            f"{_pct(stats['checksummed'], checked)}",
+            f"  bytes hashed          {human_bytes(stats['bytes_hashed'])}",
+        ]
+
+    return "\n".join(lines) + "\n"
+
+
+def write_stats_report(report: ScanReport, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_stats(report), encoding="utf-8")
     return path
 
 

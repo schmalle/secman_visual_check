@@ -71,7 +71,7 @@ raised. A dead host is a result, not a crash.
 | `--status-max-redirects N` | `10` | hops to follow; `0` records the first response and stops |
 | `--status-expect CODES` | `200` | comma-separated statuses treated as OK; `2xx`-style wildcards allowed |
 | `--status-concurrency N` | `8` | parallel checks, independent of `--concurrency` |
-| `--status-checksum` | off | hash the body of targets that answer as expected (implied by `--db-store`) |
+| `--no-status-checksum` | on | body hashing of targets that answer as expected is on by default; this turns it off. Rejected together with `--db-store` |
 | `--status-checksum-max-bytes N` | `5242880` | stop hashing a body after this many bytes |
 | `--fail-on-status` | off | exit 1 when any target's check is not OK |
 
@@ -84,8 +84,9 @@ this URL" means all of it.
 
 ## Content checksums
 
-`--status-checksum` adds one more request: after the walk settles, the body of
-the final response is streamed and hashed with sha256.
+On by default. After the walk settles, the body of the final response is
+streamed and hashed with sha256 — one more request than the walk itself needs,
+since the walk is happy with `HEAD`.
 
 Only targets that answered as **expected** are hashed. A 404's error page, a
 maintenance splash, a rate-limit notice — those change constantly and for
@@ -113,6 +114,23 @@ The checksum is what makes [URL change tracking](../db/README.md) possible: it
 is the difference between "this URL still answers" and "this URL still answers
 *and nobody changed it*".
 
+### Turning it off
+
+`--no-status-checksum` drops the body request, leaving one `HEAD` per target.
+Worth it for a large uptime-only sweep — hashing a 900 KB page costs about 0.2s
+against 0.05s for the bare check — and pointless otherwise.
+
+```bash
+python -m secman_visual_check --no-visual-check --no-status-checksum -f urls.txt
+```
+
+It is rejected together with `--db-store` (exit code `2`): the stored checksum
+is what drives change detection, so a database run without one would keep a flag
+lifecycle that can never notice a change.
+
+`--status-checksum` is still accepted and now does nothing, so scripts written
+against the old opt-in behaviour keep working.
+
 ## Skipping the browser
 
 `--no-visual-check` skips Chromium entirely — no launch, no screenshot, no model
@@ -120,7 +138,7 @@ call. The launch is the expensive part, so this is not a small saving, and the
 run works on a host with no browser installed at all:
 
 ```bash
-python -m secman_visual_check --no-visual-check --status-checksum -f urls.txt
+python -m secman_visual_check --no-visual-check -f urls.txt
 ```
 
 The banner says so:

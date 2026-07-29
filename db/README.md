@@ -103,9 +103,11 @@ Dates, all on `svc_url_state`:
 | `last_checked_at` | when the URL was last looked at |
 | `change_count` | how many times the content has changed |
 
-Checksums are computed by `--status-checksum`, which `--db-store` enables for
-you. Only targets that answered as expected are hashed — see
-[../docs/STATUS_CHECK.md](../docs/STATUS_CHECK.md).
+Checksums are computed by default, so `--db-store` needs no extra flag. Only
+targets that answered as expected are hashed — see
+[../docs/STATUS_CHECK.md](../docs/STATUS_CHECK.md). `--no-status-checksum` is
+rejected in database mode: without a checksum the flag lifecycle above could
+never notice a change.
 
 ## Schema
 

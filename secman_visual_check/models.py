@@ -347,6 +347,24 @@ class ScanReport:
                 counts[result.status_check.state] = counts.get(result.status_check.state, 0) + 1
         return counts
 
+    def status_code_counts(self) -> dict[str, int]:
+        """How many targets ended on each HTTP status code.
+
+        Keyed by the code as a string so the mapping survives JSON; targets that
+        never produced a response are counted under ``"none"``. This is the
+        answer to "how many 200s and how many of something else", which the
+        state buckets only approximate — ``client_error`` covers 401 and 404
+        alike, and ``ok`` follows ``--status-expect`` rather than meaning 200.
+        """
+        counts: dict[str, int] = {}
+        for result in self.results:
+            status = result.status_check
+            if status is None:
+                continue
+            key = str(status.final_status) if status.final_status is not None else "none"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
     @property
     def status_checked(self) -> bool:
         return any(r.status_check is not None for r in self.results)
@@ -366,6 +384,7 @@ class ScanReport:
             "target_count": len(self.results),
             "severity_counts": self.severity_counts(),
             "status_counts": self.status_counts(),
+            "status_code_counts": self.status_code_counts(),
             "max_severity": self.max_severity.value,
             "results": [r.to_dict(include_raw) for r in self.results],
         }

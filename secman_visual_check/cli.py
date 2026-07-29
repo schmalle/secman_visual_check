@@ -20,8 +20,10 @@ from .models import ScanResult, Severity
 from .reporting import (
     should_colorize,
     write_console_report,
+    write_csv_report,
     write_html_report,
     write_json_report,
+    write_stats_report,
 )
 from .db import (
     DEFAULT_DB_NAME,
@@ -95,8 +97,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     out.add_argument("--json", metavar="PATH", help="JSON report path (default: DIR/report.json)")
     out.add_argument("--html", metavar="PATH", help="HTML report path (default: DIR/report.html)")
+    out.add_argument("--csv", metavar="PATH", help="CSV report path (default: DIR/report.csv)")
+    out.add_argument(
+        "--stats",
+        metavar="PATH",
+        help="statistics report path (default: DIR/statistics.txt)",
+    )
     out.add_argument("--no-json", action="store_true", help="skip the JSON report")
     out.add_argument("--no-html", action="store_true", help="skip the HTML report")
+    out.add_argument("--no-csv", action="store_true", help="skip the CSV report")
+    out.add_argument("--no-stats", action="store_true", help="skip the statistics report")
     out.add_argument(
         "--link-images",
         action="store_true",
@@ -279,12 +289,22 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="parallel status checks (default: %(default)s)",
     )
-    status.add_argument(
+    checksum = status.add_mutually_exclusive_group()
+    checksum.add_argument(
         "--status-checksum",
+        dest="status_checksum",
         action="store_true",
+        default=True,
         help="hash the response body of targets that answer as expected, so a "
-        "later run can tell 'still up' from 'still up and unchanged' "
-        "(implied by --db-store)",
+        "later run can tell 'still up' from 'still up and unchanged'. On by "
+        "default; the flag is kept so existing scripts keep working",
+    )
+    checksum.add_argument(
+        "--no-status-checksum",
+        dest="status_checksum",
+        action="store_false",
+        help="do not fetch bodies — the status check then costs one HEAD per "
+        "target and cannot detect content changes",
     )
     status.add_argument(
         "--status-checksum-max-bytes",
@@ -753,18 +773,22 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
         max_redirects=max(0, args.status_max_redirects),
         expect_statuses=parse_status_list(args.status_expect),
         max_concurrency=max(1, args.status_concurrency),
-        # Database mode implies it: the whole point of the stored checksum is
-        # spotting content changes between runs, and there is nowhere else to
-        # keep one.
-        checksum=(
-            args.status_checksum or args.db_store or _env_flag("SECMAN_DB_STORE")
-        ),
+        checksum=args.status_checksum,
         checksum_max_bytes=max(0, args.status_checksum_max_bytes),
     )
 
     if not args.visual_check and not status_check.enabled:
         raise ValueError(
             "--no-visual-check and --no-status-check together leave nothing to do"
+        )
+
+    # Database mode depends on it: the stored checksum is what makes change
+    # detection possible, and there is nowhere else to keep one. Turning it off
+    # would leave the flag lifecycle silently broken, so say so instead.
+    if not args.status_checksum and (args.db_store or _env_flag("SECMAN_DB_STORE")):
+        raise ValueError(
+            "--no-status-checksum cannot be combined with --db-store: the stored "
+            "checksum is what makes change detection possible"
         )
 
     return ScanConfig(
@@ -1031,6 +1055,7 @@ def main(argv: list[str] | None = None) -> int:
         report,
         color=should_colorize(sys.stdout, args.color),
         verbose=args.verbose,
+        statistics=not args.no_stats,
     )
 
     if not args.no_json:
@@ -1041,6 +1066,14 @@ def main(argv: list[str] | None = None) -> int:
         path = Path(args.html) if args.html else config.output_dir / "report.html"
         write_html_report(report, path, embed_images=not args.link_images)
         print(f"HTML report: {path}")
+    if not args.no_csv:
+        path = Path(args.csv) if args.csv else config.output_dir / "report.csv"
+        write_csv_report(report, path)
+        print(f"CSV report: {path}")
+    if not args.no_stats:
+        path = Path(args.stats) if args.stats else config.output_dir / "statistics.txt"
+        write_stats_report(report, path)
+        print(f"Statistics: {path}")
 
     db_status = EXIT_OK
     flag_changes: list = []

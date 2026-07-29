@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 
@@ -13,8 +14,11 @@ from secman_visual_check.models import (
 )
 from secman_visual_check.reporting import (
     render_html,
+    report_statistics,
     write_console_report,
+    write_csv_report,
     write_json_report,
+    write_stats_report,
 )
 
 
@@ -231,6 +235,65 @@ def test_console_report_prints_the_status_line_and_summary():
     assert "ConnectError: Name or service not known" in out
 
 
+def test_console_report_prints_statistics():
+    stream = io.StringIO()
+    write_console_report(make_report(), stream=stream, color=False)
+    out = stream.getvalue()
+
+    assert "Statistics:" in out
+    assert "targets" in out
+    assert "findings" in out
+    assert "answered HTTP 200" in out
+    assert "answered another code" in out
+
+
+def test_console_statistics_hide_the_expected_row_when_it_equals_the_200_count():
+    """--status-expect defaults to 200, so the two rows would say the same thing."""
+    stream = io.StringIO()
+    write_console_report(make_report(), stream=stream, color=False)
+
+    assert "answering as expected" not in statistics_block(stream.getvalue())
+
+
+def test_console_statistics_show_the_expected_row_when_it_diverges():
+    report = make_report()
+    # A tolerated 403 is "expected" but is not a 200 — now the rows differ.
+    report.results[1].status_check.final_status = 403
+    report.results[1].status_check.expected_statuses = (200, 403)
+
+    stream = io.StringIO()
+    write_console_report(report, stream=stream, color=False)
+
+    assert "answering as expected" in statistics_block(stream.getvalue())
+
+
+def test_console_statistics_can_be_suppressed():
+    stream = io.StringIO()
+    write_console_report(make_report(), stream=stream, color=False, statistics=False)
+
+    assert "Statistics:" not in stream.getvalue()
+
+
+def statistics_block(text: str) -> str:
+    """Just the Statistics section — 'captured' also occurs in failure lines."""
+    _, _, tail = text.partition("Statistics:")
+    return tail.split("\n\n")[0]
+
+
+def test_console_statistics_omit_capture_rows_for_a_status_only_run():
+    report = make_report()
+    for result in report.results:
+        result.capture = None
+    stream = io.StringIO()
+
+    write_console_report(report, stream=stream, color=False)
+    block = statistics_block(stream.getvalue())
+
+    assert "targets" in block
+    assert "captured" not in block
+    assert "answered HTTP 200" in block
+
+
 def test_console_report_omits_the_status_block_when_no_check_ran():
     report = make_report()
     for result in report.results:
@@ -240,3 +303,224 @@ def test_console_report_omits_the_status_block_when_no_check_ran():
     write_console_report(report, stream=stream, color=False)
 
     assert "Status checks:" not in stream.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# CSV report
+# --------------------------------------------------------------------------- #
+
+
+def read_csv(path):
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_csv_report_has_one_row_per_target(tmp_path):
+    rows = read_csv(write_csv_report(make_report(), tmp_path / "report.csv"))
+
+    assert [row["url"] for row in rows] == [
+        "https://example.com/admin",
+        "https://broken.example/",
+    ]
+
+
+def test_csv_report_carries_status_capture_and_findings(tmp_path):
+    rows = read_csv(write_csv_report(make_report(), tmp_path / "report.csv"))
+    first, second = rows
+
+    assert first["status_state"] == "redirect"
+    assert first["status_ok"] == "true"
+    assert first["first_status"] == "301"
+    assert first["final_status"] == "200"
+    assert first["redirect_count"] == "1"
+    assert first["http_status"] == "200"
+    assert first["max_severity"] == "critical"
+    assert first["findings"] == "2"
+    # Categories are what a triage spreadsheet actually filters on.
+    assert first["categories"] == "infrastructure_disclosure;unauthenticated_admin"
+    assert first["page_type"] == "admin panel"
+
+    assert second["status_state"] == "unreachable"
+    assert second["status_ok"] == "false"
+    assert second["error"] == "net::ERR_NAME_NOT_RESOLVED"
+    assert second["findings"] == "0"
+
+
+def test_csv_report_survives_a_status_only_run(tmp_path):
+    """--no-visual-check leaves no capture and no analysis; the CSV still writes."""
+    report = make_report()
+    for result in report.results:
+        result.capture = None
+        result.analysis = None
+
+    rows = read_csv(write_csv_report(report, tmp_path / "report.csv"))
+
+    assert len(rows) == 2
+    assert rows[0]["status_state"] == "redirect"
+    assert rows[0]["http_status"] == ""
+    assert rows[0]["title"] == ""
+    assert rows[0]["findings"] == "0"
+    assert rows[0]["max_severity"] == "info"
+
+
+def test_csv_report_neutralises_spreadsheet_formulas(tmp_path):
+    """Page and model text lands in a spreadsheet; it must not become a formula."""
+    report = make_report()
+    report.results[0].capture.title = '=HYPERLINK("http://evil.test","click")'
+    report.results[0].analysis.summary = "+1+1"
+    report.results[0].analysis.page_type = "-nope"
+
+    rows = read_csv(write_csv_report(report, tmp_path / "report.csv"))
+
+    assert rows[0]["title"].startswith("'=")
+    assert rows[0]["summary"].startswith("'+")
+    assert rows[0]["page_type"].startswith("'-")
+
+
+# --------------------------------------------------------------------------- #
+# Statistics report
+# --------------------------------------------------------------------------- #
+
+
+def test_statistics_aggregate_the_run():
+    stats = report_statistics(make_report())
+
+    assert stats["targets"] == 2
+    assert stats["captured"] == 1
+    assert stats["capture_failed"] == 1
+    assert stats["analysed"] == 1
+    assert stats["targets_with_findings"] == 1
+    assert stats["findings_total"] == 2
+    assert stats["severity_counts"]["critical"] == 1
+    assert stats["status_checked"] == 2
+    assert stats["status_ok"] == 1
+    assert stats["status_failed"] == 1
+    assert stats["status_counts"]["unreachable"] == 1
+
+
+def make_mixed_status_report() -> ScanReport:
+    """A fleet answering a spread of codes, plus one host that never answered."""
+    codes = [200, 200, 200, 403, 404, 404, 500, None]
+    report = ScanReport(model="test/model")
+    report.results = [
+        ScanResult(
+            url=f"https://host{i}.example/",
+            status_check=UrlStatus(
+                url=f"https://host{i}.example/",
+                state="ok" if code == 200 else ("unreachable" if code is None else "client_error"),
+                first_status=code,
+                final_status=code,
+            ),
+        )
+        for i, code in enumerate(codes)
+    ]
+    return report
+
+
+def test_status_code_counts_split_200_from_everything_else():
+    counts = make_mixed_status_report().status_code_counts()
+
+    assert counts["200"] == 3
+    assert counts["404"] == 2
+    assert counts["403"] == 1
+    assert counts["500"] == 1
+    assert counts["none"] == 1
+
+
+def test_statistics_headline_the_200_versus_other_split():
+    stats = report_statistics(make_mixed_status_report())
+
+    assert stats["answered_200"] == 3
+    assert stats["answered_other"] == 4
+    assert stats["no_response"] == 1
+    # Every checked target lands in exactly one of the three.
+    assert stats["answered_200"] + stats["answered_other"] + stats["no_response"] == 8
+
+
+def test_200_split_ignores_status_expect():
+    """--status-expect 200,401 makes a 401 'expected'; it is still not a 200."""
+    report = make_mixed_status_report()
+    for result in report.results:
+        if result.status_check.final_status == 403:
+            result.status_check.expected_statuses = (200, 403)
+
+    stats = report_statistics(report)
+
+    assert stats["status_ok"] == 4  # three 200s plus the tolerated 403
+    assert stats["answered_200"] == 3
+    assert stats["answered_other"] == 4
+
+
+def test_console_lists_each_status_code():
+    stream = io.StringIO()
+    write_console_report(make_mixed_status_report(), stream=stream, color=False)
+    out = stream.getvalue()
+
+    assert "HTTP status codes:" in out
+    assert "HTTP 200" in out
+    assert "HTTP 404" in out
+    assert "no response" in out
+    assert "answered another code" in out
+
+
+def test_json_report_carries_the_status_code_counts(tmp_path):
+    data = json.loads(
+        write_json_report(
+            make_mixed_status_report(), tmp_path / "report.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert data["status_code_counts"]["200"] == 3
+    assert data["status_code_counts"]["none"] == 1
+
+
+def test_stats_file_breaks_down_the_status_codes(tmp_path):
+    text = write_stats_report(
+        make_mixed_status_report(), tmp_path / "statistics.txt"
+    ).read_text(encoding="utf-8")
+
+    assert "HTTP status codes" in text
+    assert "answered HTTP 200" in text
+    assert "answered another code" in text
+
+
+def test_statistics_count_checksummed_bodies():
+    report = make_report()
+    report.results[0].status_check.content_checksum = "a" * 64
+    report.results[0].status_check.content_length = 2048
+
+    stats = report_statistics(report)
+
+    assert stats["checksummed"] == 1
+    assert stats["bytes_hashed"] == 2048
+
+
+def test_stats_report_is_readable_text(tmp_path):
+    path = write_stats_report(make_report(), tmp_path / "statistics.txt")
+    text = path.read_text(encoding="utf-8")
+
+    assert "Targets" in text
+    assert "Findings by severity" in text
+    assert "Status checks" in text
+    assert "critical" in text
+    assert "test/model" in text
+    # Percentages make the counts comparable between runs of different sizes.
+    assert "%" in text
+
+
+def test_stats_report_omits_the_capture_block_for_a_status_only_run(tmp_path):
+    report = make_report()
+    for result in report.results:
+        result.capture = None
+
+    text = write_stats_report(report, tmp_path / "statistics.txt").read_text(encoding="utf-8")
+
+    assert "Capture\n" not in text
+    assert "Status checks" in text
+
+
+def test_stats_report_handles_an_empty_run(tmp_path):
+    """No targets means no divisions — the percentage maths must not blow up."""
+    path = write_stats_report(ScanReport(model="test/model"), tmp_path / "statistics.txt")
+
+    assert "Targets" in path.read_text(encoding="utf-8")
