@@ -2,6 +2,7 @@
 
 import builtins
 import io
+import re
 from datetime import datetime, timezone
 
 import pytest
@@ -25,12 +26,17 @@ from secman_visual_check.models import (
 
 
 class FakeCursor:
-    """Records every statement and hands out increasing lastrowid values."""
+    """Records every statement and hands out increasing lastrowid values.
+
+    SELECTs against the url_state table are answered from ``recorder.state``,
+    a ``{url_hash: row}`` map standing in for what an earlier run left behind.
+    """
 
     def __init__(self, recorder, fail_on=None):
         self.recorder = recorder
         self.fail_on = fail_on
         self.lastrowid = 0
+        self._result = None
 
     def __enter__(self):
         return self
@@ -42,8 +48,15 @@ class FakeCursor:
         if self.fail_on and self.fail_on in sql:
             raise RuntimeError("server has gone away")
         self.recorder.statements.append((sql, params))
+        if sql.lstrip().upper().startswith("SELECT"):
+            self._result = self.recorder.state.get(params[0])
+            return
+        self._result = None
         self.recorder.next_id += 1
         self.lastrowid = self.recorder.next_id
+
+    def fetchone(self):
+        return self._result
 
     def executemany(self, sql, rows):
         if self.fail_on and self.fail_on in sql:
@@ -52,8 +65,9 @@ class FakeCursor:
 
 
 class FakeConnection:
-    def __init__(self, fail_on=None):
+    def __init__(self, fail_on=None, state=None):
         self.statements = []
+        self.state = dict(state or {})
         self.next_id = 0
         self.commits = 0
         self.rollbacks = 0
@@ -119,6 +133,19 @@ def make_report():
     )
 
 
+_WRITE_RE = re.compile(r"(?:INSERT INTO|UPDATE)\s+(\w+)", re.IGNORECASE)
+
+
+def written_tables(connection):
+    """Tables touched by a write, in order. SELECTs are ignored."""
+    tables = []
+    for sql, _ in connection.statements:
+        match = _WRITE_RE.search(sql)
+        if match:
+            tables.append(match.group(1))
+    return tables
+
+
 def options(**overrides):
     base = {"enabled": True, "user": "scanner", "database": "svc_test"}
     base.update(overrides)
@@ -137,13 +164,16 @@ def test_write_report_inserts_one_run_one_status_per_check_and_every_hop():
     assert connection.commits == 1
     assert connection.rollbacks == 0
 
-    tables = [sql.split()[2] for sql, _ in connection.statements]
-    assert tables == [
+    assert written_tables(connection) == [
         "svc_scan_run",
         "svc_url_status",
         "svc_redirect_hop",
+        "svc_url_state",
         "svc_url_status",
         "svc_redirect_hop",
+        "svc_url_state",
+        # The robots-skipped target has no status row, but is still inventoried.
+        "svc_url_state",
     ]
 
 
@@ -323,3 +353,242 @@ def test_the_run_uuid_is_derived_from_the_report_so_a_re_store_collides():
 
     assert first == second
     assert len(first) == 36
+
+
+# --------------------------------------------------------------------------- #
+# URL lifecycle flags and change tracking
+# --------------------------------------------------------------------------- #
+
+
+def state_row(flag="OK", source="scanner", checksum="aaa", changes=0):
+    """A row as the SELECT in _upsert_state returns it."""
+    return (flag, source, checksum, changes, PAST, PAST)
+
+
+PAST = datetime(2026, 1, 1, 0, 0, 0)
+
+
+def url_hash(url):
+    import hashlib
+
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def one_url_report(url="https://example.com/", **status_kwargs):
+    status = make_status(url, **status_kwargs) if status_kwargs is not None else None
+    return ScanReport(results=[ScanResult(url=url, status_check=status)], tool_version="0.2.0")
+
+
+def state_writes(connection):
+    return [
+        (sql, params)
+        for sql, params in connection.statements
+        if "url_state" in sql and not sql.lstrip().upper().startswith("SELECT")
+    ]
+
+
+def test_an_unknown_url_is_inserted_as_new():
+    connection = FakeConnection()
+
+    summary = StatusStore(options(), connection=connection).write_report(
+        one_url_report(content_checksum="abc123")
+    )
+
+    assert [c.flag for c in summary.flag_changes] == ["NEW"]
+    assert summary.flag_changes[0].reason == "first seen"
+    assert summary.flag_changes[0].is_new_url is True
+    assert summary.new_urls == summary.flag_changes
+
+    sql, params = state_writes(connection)[0]
+    assert "INSERT INTO" in sql
+    assert params[3] == "NEW"
+    assert params[5] == "abc123"
+
+
+def test_a_changed_checksum_sends_an_ok_url_back_to_new():
+    url = "https://example.com/"
+    connection = FakeConnection(
+        state={url_hash(url): state_row(flag="OK", source="operator", checksum="old")}
+    )
+
+    summary = StatusStore(options(), connection=connection).write_report(
+        one_url_report(url, content_checksum="new")
+    )
+
+    assert [(c.previous, c.flag, c.reason) for c in summary.flag_changes] == [
+        ("OK", "NEW", "content changed")
+    ]
+    assert summary.changed_content == summary.flag_changes
+
+
+def test_an_unchanged_checksum_leaves_the_flag_alone():
+    url = "https://example.com/"
+    connection = FakeConnection(
+        state={url_hash(url): state_row(flag="OK", source="operator", checksum="same")}
+    )
+
+    summary = StatusStore(options(), connection=connection).write_report(
+        one_url_report(url, content_checksum="same")
+    )
+
+    assert summary.flag_changes == []
+    _, params = state_writes(connection)[0]
+    assert params[2] == "OK"
+
+
+def test_content_changing_twice_still_reports_even_though_the_flag_stays_new():
+    url = "https://example.com/"
+    connection = FakeConnection(
+        state={url_hash(url): state_row(flag="NEW", checksum="first")}
+    )
+
+    summary = StatusStore(options(), connection=connection).write_report(
+        one_url_report(url, content_checksum="second")
+    )
+
+    assert [(c.flag, c.reason) for c in summary.flag_changes] == [("NEW", "content changed")]
+
+
+def test_a_target_with_no_verdict_drops_from_ok_to_not_checked():
+    url = "https://example.com/"
+    connection = FakeConnection(state={url_hash(url): state_row(flag="OK")})
+    report = ScanReport(
+        results=[ScanResult(url=url, skipped_reason="robots.txt")], tool_version="0.2.0"
+    )
+
+    summary = StatusStore(options(), connection=connection).write_report(report)
+
+    assert [(c.previous, c.flag) for c in summary.flag_changes] == [("OK", "NOT_CHECKED")]
+
+
+def test_a_new_url_stays_new_when_a_run_reaches_no_verdict():
+    """NEW already means "needs review"; an unreachable run must not clear that."""
+    url = "https://example.com/"
+    connection = FakeConnection(state={url_hash(url): state_row(flag="NEW")})
+    report = ScanReport(
+        results=[ScanResult(url=url, skipped_reason="robots.txt")], tool_version="0.2.0"
+    )
+
+    summary = StatusStore(options(), connection=connection).write_report(report)
+
+    assert summary.flag_changes == []
+    _, params = state_writes(connection)[0]
+    assert params[2] == "NEW"
+
+
+def test_an_operator_flag_survives_a_run_that_reached_no_verdict():
+    url = "https://example.com/"
+    connection = FakeConnection(
+        state={url_hash(url): state_row(flag="OK", source="operator")}
+    )
+    report = ScanReport(
+        results=[ScanResult(url=url, skipped_reason="robots.txt")], tool_version="0.2.0"
+    )
+
+    summary = StatusStore(options(), connection=connection).write_report(report)
+
+    assert summary.flag_changes == []
+    _, params = state_writes(connection)[0]
+    assert params[2] == "OK"
+    assert params[4] == "operator"  # source is not rewritten to 'scanner'
+
+
+def test_a_scanner_flag_is_downgraded_by_a_run_that_reached_no_verdict():
+    url = "https://example.com/"
+    connection = FakeConnection(
+        state={url_hash(url): state_row(flag="OK", source="scanner")}
+    )
+
+    summary = StatusStore(options(), connection=connection).write_report(
+        one_url_report(url, state="unreachable", final_status=None)
+    )
+
+    assert [(c.previous, c.flag) for c in summary.flag_changes] == [("OK", "NOT_CHECKED")]
+
+
+def test_an_unreachable_run_does_not_erase_the_last_known_checksum():
+    url = "https://example.com/"
+    connection = FakeConnection(state={url_hash(url): state_row(checksum="kept")})
+
+    StatusStore(options(), connection=connection).write_report(
+        one_url_report(url, state="unreachable", final_status=None)
+    )
+
+    sql, params = state_writes(connection)[0]
+    assert "COALESCE(%s, content_checksum)" in sql
+    assert params[5] is None  # nothing to write, so COALESCE keeps the stored value
+
+
+def test_set_flags_inserts_an_unknown_url_as_an_operator_decision():
+    connection = FakeConnection()
+
+    changes = StatusStore(options(), connection=connection).set_flags(
+        [("https://example.com/", "ok")]
+    )
+
+    assert [(c.previous, c.flag) for c in changes] == [(None, "OK")]
+    sql, params = state_writes(connection)[0]
+    assert "INSERT INTO" in sql
+    assert params[3] == "OK"
+    assert connection.commits == 1
+
+
+def test_set_flags_updates_a_known_url_and_marks_it_operator_set():
+    url = "https://example.com/"
+    connection = FakeConnection(state={url_hash(url): ("NEW",)})
+
+    changes = StatusStore(options(), connection=connection).set_flags([(url, "OK")])
+
+    assert [(c.previous, c.flag) for c in changes] == [("NEW", "OK")]
+    sql, _ = state_writes(connection)[0]
+    assert "flag_source = 'operator'" in sql
+
+
+def test_set_flags_rejects_an_unknown_flag():
+    connection = FakeConnection()
+
+    with pytest.raises(ValueError, match="unknown flag"):
+        StatusStore(options(), connection=connection).set_flags(
+            [("https://example.com/", "MAYBE")]
+        )
+
+    assert connection.rollbacks == 1
+    assert connection.commits == 0
+
+
+def test_parse_flag_normalises_spelling():
+    assert db_module.parse_flag("ok") == "OK"
+    assert db_module.parse_flag("NOT CHECKED") == "NOT_CHECKED"
+    assert db_module.parse_flag("not-checked") == "NOT_CHECKED"
+    assert db_module.parse_flag(" new ") == "NEW"
+
+
+def test_flag_changes_appear_in_the_printed_database_report():
+    stream = io.StringIO()
+    summary = DbWriteSummary(enabled=True, dsn="h:3306/d", checks_written=1)
+    summary.flag_changes = [
+        db_module.FlagChange("https://example.com/", "NEW", "OK", "content changed")
+    ]
+
+    write_db_report(summary, stream)
+    out = stream.getvalue()
+
+    assert "flags moved: 1 NEW" in out
+    assert "[OK -> NEW] https://example.com/  (content changed)" in out
+
+
+def test_write_flag_report_lists_every_assignment():
+    stream = io.StringIO()
+
+    db_module.write_flag_report(
+        [
+            db_module.FlagChange("https://a.example/", "OK", "NEW", "set by operator"),
+            db_module.FlagChange("https://b.example/", "OK", None, "set by operator"),
+        ],
+        stream,
+    )
+    out = stream.getvalue()
+
+    assert "URL flags — 2 updated" in out
+    assert "[NEW -> OK] https://a.example/" in out
+    assert "[OK] https://b.example/" in out

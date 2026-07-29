@@ -370,3 +370,132 @@ def test_check_outside_the_context_manager_is_a_programming_error():
 
     with pytest.raises(RuntimeError):
         asyncio.run(checker.check("https://example.com/"))
+
+
+# --------------------------------------------------------------------------- #
+# Body checksum
+# --------------------------------------------------------------------------- #
+
+
+def body_responder(body, status_code=200, content_type="text/html"):
+    def handler(request):
+        if request.method == "HEAD":
+            return httpx.Response(status_code, headers={"content-type": content_type})
+        return httpx.Response(status_code, content=body, headers={"content-type": content_type})
+
+    return handler
+
+
+def test_no_checksum_is_computed_unless_asked():
+    status = run_check(body_responder(b"<h1>hi</h1>"))
+
+    assert status.content_checksum is None
+    assert status.content_length is None
+
+
+def test_checksum_hashes_the_body_of_a_healthy_target():
+    import hashlib
+
+    body = b"<h1>hi</h1>"
+    status = run_check(body_responder(body), checksum=True)
+
+    assert status.content_checksum == hashlib.sha256(body).hexdigest()
+    assert status.content_length == len(body)
+    assert status.content_type == "text/html"
+    assert status.content_truncated is False
+
+
+def test_the_same_body_hashes_the_same_and_a_changed_one_does_not():
+    first = run_check(body_responder(b"same"), checksum=True)
+    again = run_check(body_responder(b"same"), checksum=True)
+    changed = run_check(body_responder(b"different"), checksum=True)
+
+    assert first.content_checksum == again.content_checksum
+    assert first.content_checksum != changed.content_checksum
+
+
+def test_no_checksum_for_a_target_that_did_not_answer_as_expected():
+    # A 404's error page changes for reasons nobody wants to be alerted about.
+    status = run_check(body_responder(b"not found", status_code=404), checksum=True)
+
+    assert status.state == "client_error"
+    assert status.content_checksum is None
+
+
+def test_an_empty_body_records_a_length_but_no_checksum():
+    status = run_check(body_responder(b""), checksum=True)
+
+    assert status.state == "ok"
+    assert status.content_length == 0
+    assert status.content_checksum is None
+
+
+def test_a_body_over_the_cap_is_hashed_up_to_it_and_marked_truncated():
+    import hashlib
+
+    body = b"x" * 5000
+    status = run_check(body_responder(body), checksum=True, checksum_max_bytes=1000)
+
+    assert status.content_truncated is True
+    assert status.content_length == 1000
+    assert status.content_checksum == hashlib.sha256(body[:1000]).hexdigest()
+
+
+def test_the_checksum_follows_the_redirect_chain_to_its_end():
+    import hashlib
+
+    body = b"<h1>arrived</h1>"
+
+    def handler(request):
+        if str(request.url).endswith("/old"):
+            return httpx.Response(301, headers={"Location": "/new"})
+        if request.method == "HEAD":
+            return httpx.Response(200)
+        return httpx.Response(200, content=body)
+
+    status = run_check(handler, url="https://example.com/old", checksum=True)
+
+    assert status.state == "redirect"
+    assert status.content_checksum == hashlib.sha256(body).hexdigest()
+
+
+def test_a_failed_body_read_costs_the_checksum_not_the_verdict():
+    calls = []
+
+    def handler(request):
+        calls.append(request.method)
+        if request.method == "HEAD":
+            return httpx.Response(200)
+        raise httpx.ReadTimeout("body read timed out", request=request)
+
+    status = run_check(handler, checksum=True)
+
+    assert status.state == "ok"  # the status verdict still stands
+    assert status.ok is True
+    assert status.content_checksum is None
+    assert "checksum unavailable" in status.error
+
+
+def test_a_target_that_changes_answer_between_the_walk_and_the_body_read():
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        if request.method == "HEAD":
+            return httpx.Response(200)
+        return httpx.Response(503)
+
+    status = run_check(handler, checksum=True)
+
+    assert status.state == "ok"
+    assert status.content_checksum is None
+    assert status.content_type is None
+
+
+def test_checksum_appears_in_to_dict():
+    payload = run_check(body_responder(b"body"), checksum=True).to_dict()
+
+    assert len(payload["content_checksum"]) == 64
+    assert payload["content_length"] == 4
+    assert payload["content_type"] == "text/html"
+    assert payload["content_truncated"] is False

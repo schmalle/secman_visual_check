@@ -71,6 +71,8 @@ raised. A dead host is a result, not a crash.
 | `--status-max-redirects N` | `10` | hops to follow; `0` records the first response and stops |
 | `--status-expect CODES` | `200` | comma-separated statuses treated as OK; `2xx`-style wildcards allowed |
 | `--status-concurrency N` | `8` | parallel checks, independent of `--concurrency` |
+| `--status-checksum` | off | hash the body of targets that answer as expected (implied by `--db-store`) |
+| `--status-checksum-max-bytes N` | `5242880` | stop hashing a body after this many bytes |
 | `--fail-on-status` | off | exit 1 when any target's check is not OK |
 
 The check inherits the browser's identity so both requests look like one client:
@@ -79,6 +81,56 @@ apply to it. `--status-timeout` overrides `--timeout` for the check alone.
 
 Targets skipped by `--respect-robots` are not checked either — "do not touch
 this URL" means all of it.
+
+## Content checksums
+
+`--status-checksum` adds one more request: after the walk settles, the body of
+the final response is streamed and hashed with sha256.
+
+Only targets that answered as **expected** are hashed. A 404's error page, a
+maintenance splash, a rate-limit notice — those change constantly and for
+reasons nobody wants to be alerted about, so hashing them would produce a change
+feed of pure noise.
+
+- The body is streamed and discarded chunk by chunk; nothing is buffered whole.
+- Past `--status-checksum-max-bytes` (5 MiB) hashing stops and the result is
+  marked `content_truncated`. A change checker should not download an ISO to
+  notice that a heading moved.
+- An empty body records `content_length: 0` and **no** checksum — "no content"
+  is a different fact from "content that happens to be empty".
+- If the body read fails, the status verdict still stands; only the checksum is
+  lost, and the reason is appended to `error`.
+
+On screen:
+
+```
+[INFO] https://example.com/admin
+  status: 200 ok  (0.12s)
+  content: sha256:1a2b3c4d5e6f  4.2 KB  text/html
+```
+
+The checksum is what makes [URL change tracking](../db/README.md) possible: it
+is the difference between "this URL still answers" and "this URL still answers
+*and nobody changed it*".
+
+## Skipping the browser
+
+`--no-visual-check` skips Chromium entirely — no launch, no screenshot, no model
+call. The launch is the expensive part, so this is not a small saving, and the
+run works on a host with no browser installed at all:
+
+```bash
+python -m secman_visual_check --no-visual-check --status-checksum -f urls.txt
+```
+
+The banner says so:
+
+```
+Scanning 3 target(s) with 8 status worker(s); analysis: no browser (status check only)
+```
+
+`--no-visual-check` together with `--no-status-check` leaves nothing to do, and
+is rejected before the scan starts.
 
 ## Output
 
@@ -143,6 +195,10 @@ Both are additive — nothing that existed before changed shape.
     {"url": "http://old.example.com/", "status": 301, "location": "/new", "elapsed_s": 0.081},
     {"url": "http://old.example.com/new", "status": 200, "location": null, "elapsed_s": 0.263}
   ],
+  "content_checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+  "content_length": 4321,
+  "content_type": "text/html",
+  "content_truncated": false,
   "error": null,
   "elapsed_s": 0.344,
   "checked_at": "2026-07-29T09:14:02.113000+00:00"
@@ -171,5 +227,7 @@ tell you which gate fired; the console report does.
 - **SecMan** — `--secman-status-findings` turns failed checks into
   vulnerabilities, and `--secman-register-assets` puts every scanned host in the
   asset inventory. See [SECMAN_UPLOAD.md](SECMAN_UPLOAD.md).
-- **MariaDB** — `--db-store` mirrors every check into a queryable database. See
+- **MariaDB** — `--db-store` mirrors every check into a queryable database, and
+  turns the checksum into per-URL change tracking. See
   [../db/README.md](../db/README.md).
+- **Email** — `--mail` sends the result to an inbox. See [EMAIL.md](EMAIL.md).

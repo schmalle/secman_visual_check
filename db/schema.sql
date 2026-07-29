@@ -53,6 +53,37 @@ CREATE TABLE IF NOT EXISTS svc_url_status (
     REFERENCES svc_scan_run (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- One row per URL, carried across runs: the review flag, the content checksum,
+-- and when the URL was first seen and last changed. svc_url_status above is the
+-- per-run log; this is the current state of each URL.
+CREATE TABLE IF NOT EXISTS svc_url_state (
+  id                BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  url               VARCHAR(2048)   NOT NULL,
+  url_hash          CHAR(64)        NOT NULL,
+  hostname          VARCHAR(255)    NOT NULL DEFAULT '',
+  -- NEW: never reviewed, or its content changed since it was.
+  -- OK: reviewed and unchanged since.
+  -- NOT_CHECKED: known, but the last run did not establish a verdict.
+  flag              VARCHAR(16)     NOT NULL DEFAULT 'NEW',
+  flag_set_at       DATETIME(3)     NOT NULL,
+  -- Who or what last set the flag: 'scanner' or 'operator'.
+  flag_source       VARCHAR(16)     NOT NULL DEFAULT 'scanner',
+  content_checksum  CHAR(64)        NULL,
+  content_length    BIGINT UNSIGNED NULL,
+  content_type      VARCHAR(128)    NULL,
+  last_state        VARCHAR(24)     NULL,
+  last_status       SMALLINT        NULL,
+  -- Initial addition, last content change, and last time we looked.
+  first_seen_at     DATETIME(3)     NOT NULL,
+  last_changed_at   DATETIME(3)     NULL,
+  last_checked_at   DATETIME(3)     NULL,
+  change_count      INT UNSIGNED    NOT NULL DEFAULT 0,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_url_state_url (url_hash),
+  KEY ix_url_state_flag (flag, last_checked_at),
+  KEY ix_url_state_host (hostname)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE IF NOT EXISTS svc_redirect_hop (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   status_id   BIGINT UNSIGNED NOT NULL,

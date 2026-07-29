@@ -188,6 +188,14 @@ class UrlStatus:
     final_url: str | None = None
     chain: list[RedirectHop] = field(default_factory=list)
     expected_statuses: tuple[int, ...] = (200,)
+    #: sha256 of the response body, set only when the target answered an
+    #: expected status *and* actually returned content. ``None`` means "not
+    #: computed" — an empty body is recorded as a checksum of zero bytes, which
+    #: is a different fact from having no checksum at all.
+    content_checksum: str | None = None
+    content_length: int | None = None
+    content_type: str | None = None
+    content_truncated: bool = False
     error: str | None = None
     elapsed_s: float = 0.0
     checked_at: datetime = field(default_factory=utcnow)
@@ -221,6 +229,10 @@ class UrlStatus:
             "redirect_count": self.redirect_count,
             "expected_statuses": list(self.expected_statuses),
             "chain": [hop.to_dict() for hop in self.chain],
+            "content_checksum": self.content_checksum,
+            "content_length": self.content_length,
+            "content_type": self.content_type,
+            "content_truncated": self.content_truncated,
             "error": self.error,
             "elapsed_s": round(self.elapsed_s, 3),
             "checked_at": self.checked_at.isoformat(),

@@ -11,6 +11,7 @@ which is what a non-browser client actually sees.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urljoin, urlsplit
@@ -22,6 +23,9 @@ DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_MAX_REDIRECTS = 10
 DEFAULT_EXPECT: tuple[int, ...] = (200,)
 DEFAULT_CONCURRENCY = 8
+#: 5 MiB. Past this the body is hashed up to the cap and marked truncated — a
+#: change checker should not download an ISO to notice a heading moved.
+DEFAULT_CHECKSUM_MAX_BYTES = 5 * 1024 * 1024
 
 #: Statuses where a HEAD answer says more about the server's HEAD support than
 #: about the resource, so the hop is retried with GET.
@@ -39,6 +43,10 @@ class StatusCheckOptions:
     max_redirects: int = DEFAULT_MAX_REDIRECTS
     expect_statuses: tuple[int, ...] = DEFAULT_EXPECT
     max_concurrency: int = DEFAULT_CONCURRENCY
+    #: Hash the response body of targets that answer as expected, so a later run
+    #: can tell "still up" from "still up and unchanged".
+    checksum: bool = False
+    checksum_max_bytes: int = DEFAULT_CHECKSUM_MAX_BYTES
     user_agent: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     basic_auth: tuple[str, str] | None = None
@@ -196,10 +204,62 @@ class UrlStatusChecker:
             status.state = "unreachable"
             status.error = f"{type(exc).__name__}: {exc}"[:300]
 
-        status.elapsed_s = time.monotonic() - started
         if status.state == "unknown":
             status.state = _classify(status)
+
+        # Only worth a body fetch once we know the target answered as asked: a
+        # 404's error page changes for reasons nobody wants to be alerted about.
+        if options.checksum and status.ok and status.final_url:
+            await self._add_checksum(status)
+
+        status.elapsed_s = time.monotonic() - started
         return status
+
+    async def _add_checksum(self, status: UrlStatus) -> None:
+        """Hash the body of the final response, up to the size cap."""
+        import httpx
+
+        client = self._client
+        assert client is not None
+        digest = hashlib.sha256()
+        size = 0
+        limit = self.options.checksum_max_bytes
+
+        try:
+            async with client.stream("GET", status.final_url) as response:
+                status.content_type = response.headers.get("content-type")
+                if response.status_code not in status.expected_statuses:
+                    # The target changed answer between the walk and this fetch.
+                    status.content_type = None
+                    return
+                async for chunk in response.aiter_bytes():
+                    if limit and size + len(chunk) > limit:
+                        digest.update(chunk[: limit - size])
+                        size = limit
+                        status.content_truncated = True
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+        except httpx.HTTPError as exc:
+            # The status verdict already stands; a failed body read only costs
+            # us the checksum, so it is recorded rather than promoted to an error.
+            status.content_type = None
+            status.content_checksum = None
+            status.content_length = None
+            status.content_truncated = False
+            _append_error(status, f"checksum unavailable: {_short_error(exc)}")
+            return
+        except Exception as exc:  # pragma: no cover - unexpected client failure
+            _append_error(status, f"checksum unavailable: {type(exc).__name__}")
+            return
+
+        if size == 0 and not status.content_truncated:
+            # No body at all — a 204, a HEAD-like response, an empty file. There
+            # is nothing to checksum, and hashing "" would look like content.
+            status.content_length = 0
+            return
+        status.content_checksum = digest.hexdigest()
+        status.content_length = size
 
     async def _request(self, method: str, url: str):
         """One hop. Returns ``(response, method_used)``.
@@ -247,6 +307,12 @@ def _classify(status: UrlStatus) -> str:
     # A 1xx or a 2xx nobody asked for — a 204 where 200 was expected. Calling
     # that "ok" while ok is False would be a contradiction on screen.
     return "unexpected_status"
+
+
+def _append_error(status: UrlStatus, message: str) -> None:
+    """Add a note without discarding whatever the walk already recorded."""
+    status.error = f"{status.error}; {message}" if status.error else message
+    status.error = status.error[:300]
 
 
 def _short_error(exc: BaseException) -> str:

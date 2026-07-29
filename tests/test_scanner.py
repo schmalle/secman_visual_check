@@ -220,3 +220,23 @@ def test_the_status_check_still_records_a_target_the_browser_could_not_load(
 
     assert report.results[0].capture.load_error
     assert report.results[0].status_check.state == "ok"
+
+
+def test_no_visual_check_never_launches_the_browser(patched, tmp_path):
+    config = make_config(tmp_path, with_ai=True, visual_check=False)
+    report = asyncio.run(scanner.run_scan(["https://a.example/"], config))
+
+    assert FakeCapturer.instances == []
+    assert "analyzer" in patched  # the analyzer was built...
+    assert patched["analyzer"].analyzed == []  # ...but had nothing to look at
+    assert report.results[0].capture is None
+    assert report.results[0].status_check.state == "ok"
+
+
+def test_a_browserless_run_still_produces_a_report(patched, tmp_path):
+    config = make_config(tmp_path, with_ai=False, visual_check=False)
+    report = asyncio.run(scanner.run_scan(["https://a.example/", "https://b.example/"], config))
+
+    assert len(report.results) == 2
+    assert report.status_counts()["ok"] == 2
+    assert report.failed == []

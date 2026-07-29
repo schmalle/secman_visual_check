@@ -45,9 +45,14 @@ async def run_scan(
     completed_lock = asyncio.Lock()
 
     async with contextlib.AsyncExitStack() as stack:
-        capturer = await stack.enter_async_context(
-            BrowserCapturer(config.capture, config.screenshot_dir)
-        )
+        # Skipping the visual check must skip the *launch*, not just the
+        # screenshot: starting Chromium is the expensive part, and a status-only
+        # run should work on a host that has no browser installed at all.
+        capturer: BrowserCapturer | None = None
+        if config.visual_check:
+            capturer = await stack.enter_async_context(
+                BrowserCapturer(config.capture, config.screenshot_dir)
+            )
         checker: UrlStatusChecker | None = None
         if config.status_check.enabled:
             checker = await stack.enter_async_context(UrlStatusChecker(config.status_check))
@@ -70,11 +75,12 @@ async def run_scan(
                     # the page. The checker bounds its own fan-out.
                     if checker is not None:
                         result.status_check = await checker.check(url)
-                    async with capture_sem:
-                        result.capture = await capturer.capture(url)
-                    if analyzer is not None and result.capture.worth_analyzing:
-                        async with analysis_sem:
-                            result.analysis = await analyzer.analyze(result.capture)
+                    if capturer is not None:
+                        async with capture_sem:
+                            result.capture = await capturer.capture(url)
+                        if analyzer is not None and result.capture.worth_analyzing:
+                            async with analysis_sem:
+                                result.analysis = await analyzer.analyze(result.capture)
             except Exception as exc:
                 result.error = f"{type(exc).__name__}: {exc}"[:400]
 

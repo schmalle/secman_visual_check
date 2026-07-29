@@ -64,6 +64,27 @@ STATUS_DISPLAY_ORDER = (
 )
 
 
+def checksum_summary(status: UrlStatus) -> str:
+    """``sha256:1a2b3c4d…  4.2 KB  text/html`` — the short form used everywhere."""
+    if not status.content_checksum:
+        return ""
+    bits = [f"sha256:{status.content_checksum[:12]}"]
+    if status.content_length is not None:
+        bits.append(human_bytes(status.content_length) + (" (truncated)" if status.content_truncated else ""))
+    if status.content_type:
+        bits.append(status.content_type.split(";")[0].strip())
+    return "  ".join(bits)
+
+
+def human_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"  # pragma: no cover - unreachable, loop returns first
+
+
 def _paint(text: str, severity: Severity, color: bool) -> str:
     if not color:
         return text
@@ -165,6 +186,8 @@ def _write_status_line(status: UrlStatus, out: TextIO, use_color: bool) -> None:
         for hop in status.chain:
             arrow = f" -> {hop.location}" if hop.location else ""
             print(f"    {hop.status} {hop.url}{arrow}", file=out)
+    if status.content_checksum:
+        print(f"  content: {checksum_summary(status)}", file=out)
 
 
 def _write_result(result: ScanResult, out: TextIO, use_color: bool, verbose: bool) -> None:
@@ -413,6 +436,8 @@ def _render_status(status: UrlStatus) -> str:
             for hop in status.chain
         )
         parts.append(f'<ol class="chain">{hops}</ol>')
+    if status.content_checksum:
+        parts.append(f'<p class="kv">{html.escape(checksum_summary(status))}</p>')
     return "".join(parts)
 
 

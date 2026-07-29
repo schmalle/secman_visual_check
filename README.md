@@ -49,6 +49,20 @@ python -m secman_visual_check -f examples/urls.txt -o ./scan-2026-07-27
 
 # Screenshots only, no model calls and no API key needed
 python -m secman_visual_check --no-ai https://example.com
+
+# No browser at all — just check what each URL answers
+python -m secman_visual_check --no-visual-check -f examples/urls.txt
+```
+
+Targets come from the command line, from one or more files (`-f`, repeatable),
+or from stdin (`--stdin`). A target file is one URL per line; blank lines and
+`#` comments are ignored, a missing scheme defaults to `https://`, and
+duplicates are dropped:
+
+```
+# examples/urls.txt
+https://example.com/admin
+example.com/backup/          # scheme optional, trailing comments fine
 ```
 
 Output lands in `scan-output/` by default:
@@ -108,7 +122,84 @@ python -m secman_visual_check --fail-on-status -f urls.txt
 python -m secman_visual_check --no-status-check https://example.com
 ```
 
+### Content checksums
+
+`--status-checksum` hashes the body of every target that answers as expected, so
+a later run can tell *still up* from *still up and unchanged*:
+
+```
+[INFO] https://example.com/admin
+  status: 200 ok  (0.12s)
+  content: sha256:1a2b3c4d5e6f  4.2 KB  text/html
+```
+
+Only healthy targets are hashed — a 404's error page changes for reasons nobody
+wants to be alerted about. Bodies are streamed and capped at
+`--status-checksum-max-bytes` (5 MiB), and `--db-store` turns this on for you,
+since the stored checksum is what makes change detection possible.
+
+### Skipping the browser
+
+`--no-visual-check` skips Chromium entirely — no screenshots, no model calls.
+What remains is a fast status and checksum checker that runs anywhere, with no
+browser installed:
+
+```bash
+python -m secman_visual_check --no-visual-check --status-checksum -f urls.txt
+```
+
 Full reference: [docs/STATUS_CHECK.md](docs/STATUS_CHECK.md).
+
+## Tracking URLs over time
+
+With `--db-store`, every URL carries a flag between runs:
+
+| flag | meaning |
+| --- | --- |
+| `NEW` | never reviewed — or reviewed once and changed since |
+| `OK` | reviewed and unchanged since. Only an operator sets this |
+| `NOT_CHECKED` | known, but the last run reached no verdict |
+
+The scanner never writes `OK`: it can tell you a URL answers and that its
+content has not moved, not that somebody looked at it and was happy. You do
+that:
+
+```bash
+python -m secman_visual_check --db-set-flag https://example.com/admin=OK
+```
+
+And the tool takes it back when the evidence expires — **when a URL's checksum
+changes, its flag returns to `NEW`**, because an `OK` verdict describes the
+content that was reviewed and cannot outlive it. Each URL also records when it
+was first seen, when its content last changed, and when it was last checked.
+
+A run that cannot reach a URL drops it from `OK` to `NOT_CHECKED`, but never
+touches a `NEW` one — that still needs review — and never overrides a flag an
+operator set, since one unreachable run is not evidence against a human
+decision.
+
+See [db/README.md](db/README.md) for the schema and the install script.
+
+## Emailing the results
+
+```bash
+python -m secman_visual_check --mail \
+  --mail-from scanner@example.com --mail-to ops@example.com \
+  --mail-transport o365 --mail-tenant-id ... --mail-client-id ... --mail-client-secret ... \
+  -f urls.txt
+```
+
+Three transports: `smtp` (default), `o365` (Microsoft Graph `sendMail`, client
+credentials, needs the `Mail.Send` application permission) and `ses` (AWS SES
+via boto3 — `pip install 'secman-visual-check[aws]'`, credentials resolved the
+normal AWS way). The message is HTML with a plain-text alternative, styled to
+match SecMan's own notification emails so both land in an inbox looking like
+one system.
+
+By default a clean run sends nothing — `--mail-always` overrides that, and
+`--mail-dry-run` renders the message and prints the subject without delivering
+it. When database mode is on, the email also reports which URLs are new and
+which changed.
 
 ## What it looks at
 
@@ -289,10 +380,14 @@ troubleshooting: [docs/SECMAN_UPLOAD.md](docs/SECMAN_UPLOAD.md).
 | `--respect-robots` | Skip URLs the origin's `robots.txt` disallows. Off by default: you are scanning your own assets. |
 | `--link-images` | Link screenshots from the HTML report instead of embedding them, for large scans. |
 | `--include-raw` | Keep the raw model replies in the JSON report, for debugging prompts. |
+| `--no-visual-check` | Skip the browser entirely: no screenshots, no model calls, no Chromium needed. |
 | `--no-status-check` | Skip the HTTP status/redirect pre-check. |
+| `--status-checksum`, `--status-checksum-max-bytes` | Hash the body of healthy targets so changes are detectable between runs. |
 | `--status-expect 200,401`, `--status-max-redirects`, `--status-method`, `--status-timeout`, `--status-concurrency` | Tune the status check. See [docs/STATUS_CHECK.md](docs/STATUS_CHECK.md). |
 | `--fail-on-status` | Exit 1 when any target's status check is not OK. |
 | `--db-store`, `--db-url`, `--db-*` | Mirror the status results into MariaDB. See [db/README.md](db/README.md). |
+| `--db-set-flag URL=FLAG` | Flag a URL as `OK`, `NEW` or `NOT_CHECKED` and exit. |
+| `--mail`, `--mail-transport`, `--mail-to`, `--mail-*` | Email the results over SMTP, Microsoft 365 or AWS SES. |
 | `-v/--verbose` | Print evidence and remediation for every finding. |
 
 Full list: `python -m secman_visual_check --help`.
@@ -324,6 +419,10 @@ Full list: `python -m secman_visual_check --help`.
         "expected_statuses": [200],
         "chain": [{"url": "https://example.com/backup/", "status": 200, "location": null,
                    "elapsed_s": 0.021}],
+        "content_checksum": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        "content_length": 4321,
+        "content_type": "text/html",
+        "content_truncated": false,
         "error": null,
         "elapsed_s": 0.021,
         "checked_at": "2026-07-29T09:14:02.113000+00:00"
@@ -361,14 +460,15 @@ target was skipped by `robots.txt`.
 | --- | --- |
 | `targets.py` | Parse, normalise and de-duplicate URLs |
 | `capture.py` | Playwright: navigate, screenshot, extract title/text/status |
-| `status.py` | HTTP status/redirect pre-check, walked hop by hop |
+| `status.py` | HTTP status/redirect pre-check and body checksum |
 | `categories.py` | The policy — what counts as critical content |
 | `prompts.py` | System prompt, user prompt, and the response JSON schema |
 | `analyzer.py` | OpenAI-compatible vision call, retries, lenient JSON parsing |
 | `scanner.py` | Pipelines capture → analysis with independent concurrency limits |
 | `reporting.py` | Console, JSON and HTML output |
 | `secman.py` | Maps findings onto SecMan vulnerabilities; HTTP and MCP upload |
-| `db.py` | Optional MariaDB mirror of the status results |
+| `db.py` | Optional MariaDB mirror: status history, URL flags, change tracking |
+| `mailer.py` | Result email over SMTP, Microsoft 365 or AWS SES |
 | `cli.py` | Argument parsing and exit codes |
 
 ## Caveats
