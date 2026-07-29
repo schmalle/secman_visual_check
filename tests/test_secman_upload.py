@@ -13,6 +13,7 @@ from secman_visual_check.models import (
     ScanReport,
     ScanResult,
     Severity,
+    UrlStatus,
 )
 from secman_visual_check.secman import (
     DEFAULT_ID_PREFIX,
@@ -23,6 +24,8 @@ from secman_visual_check.secman import (
     UploadItem,
     asset_name,
     build_items,
+    build_status_items,
+    collect_assets,
     load_report_json,
     merge_duplicates,
     upload_findings,
@@ -190,6 +193,7 @@ class FakeUploader:
         self.fail_on = set(fail_on)
         self.lookup_error = lookup_error
         self.uploaded: list[UploadItem] = []
+        self.registered: list[tuple[str, str, str, str]] = []
         self.connected = False
         self.closed = False
 
@@ -205,6 +209,12 @@ class FakeUploader:
         if item.vulnerability_id in self.fail_on:
             raise SecmanError("rejected")
         self.uploaded.append(item)
+        return "created", "ok"
+
+    def register_asset(self, hostname, owner, uri, asset_type):
+        if hostname in self.fail_on:
+            raise SecmanError("rejected")
+        self.registered.append((hostname, owner, uri, asset_type))
         return "created", "ok"
 
     def close(self):
@@ -712,3 +722,220 @@ def test_load_report_json_rejects_a_non_object(tmp_path):
     path.write_text("[1, 2]", encoding="utf-8")
     with pytest.raises(SecmanError, match="scan report object"):
         load_report_json(path)
+
+
+# --------------------------------------------------------------------------- #
+# Status findings and asset registration
+# --------------------------------------------------------------------------- #
+
+
+def status_result(url: str, state: str, **overrides) -> ScanResult:
+    status = UrlStatus(url=url, state=state, first_status=200, final_status=200)
+    for key, value in overrides.items():
+        setattr(status, key, value)
+    return ScanResult(url=url, status_check=status)
+
+
+def status_report() -> ScanReport:
+    return make_report(
+        status_result("https://example.com/", "ok"),
+        status_result("https://example.com/gone", "client_error", final_status=404),
+        status_result("https://example.com/boom", "server_error", final_status=503),
+        status_result(
+            "https://dead.example/",
+            "unreachable",
+            final_status=None,
+            error="ConnectError: Name or service not known",
+        ),
+    )
+
+
+def test_healthy_targets_produce_no_status_findings():
+    items, dropped = build_status_items(
+        make_report(
+            status_result("https://example.com/", "ok"),
+            status_result("https://example.com/x", "redirect"),
+        )
+    )
+    assert items == []
+    assert dropped == 0
+
+
+def test_status_findings_map_each_state_to_a_category_and_severity():
+    items, _ = build_status_items(status_report())
+    by_url = {i.url: i for i in items}
+
+    assert by_url["https://example.com/gone"].category == "unexpected_status"
+    assert by_url["https://example.com/gone"].severity is Severity.MEDIUM
+    assert by_url["https://example.com/boom"].severity is Severity.HIGH
+    assert by_url["https://dead.example/"].category == "unreachable"
+    assert by_url["https://dead.example/"].severity is Severity.HIGH
+    assert "404" in by_url["https://example.com/gone"].title
+    assert "unreachable" in by_url["https://dead.example/"].title.lower()
+
+
+def test_status_finding_ids_are_stable_and_readable():
+    first, _ = build_status_items(status_report())
+    second, _ = build_status_items(status_report())
+
+    assert [i.vulnerability_id for i in first] == [i.vulnerability_id for i in second]
+    assert any(i.vulnerability_id.startswith(f"{DEFAULT_ID_PREFIX}-UNREACHABLE-") for i in first)
+    assert any(
+        i.vulnerability_id.startswith(f"{DEFAULT_ID_PREFIX}-UNEXPECTED-STATUS-") for i in first
+    )
+
+
+def test_status_findings_respect_the_severity_threshold():
+    items, dropped = build_status_items(status_report(), min_severity=Severity.HIGH)
+
+    assert dropped == 1  # the 404 is only medium
+    assert {i.severity for i in items} == {Severity.HIGH}
+
+
+def test_status_severity_override_applies_to_every_state():
+    items, _ = build_status_items(
+        status_report(), min_severity=Severity.INFO, severity_override=Severity.LOW
+    )
+
+    assert {i.severity for i in items} == {Severity.LOW}
+    assert {i.criticality for i in items} == {"LOW"}
+
+
+def test_a_report_without_status_checks_yields_nothing():
+    assert build_status_items(two_finding_report()) == ([], 0)
+
+
+def test_status_findings_on_one_host_stay_distinct_per_page():
+    items, _ = build_status_items(status_report())
+    merged, count = merge_duplicates(items)
+
+    # /gone and /boom share a category but not a path, so both survive.
+    assert count == 0
+    assert len(merged) == 3
+
+
+def test_collect_assets_returns_one_entry_per_host():
+    report = make_report(
+        status_result("https://example.com/a", "ok"),
+        status_result("https://example.com/b", "ok"),
+        status_result("https://other.example/", "ok"),
+    )
+
+    assets = collect_assets(report)
+
+    assert [host for host, _ in assets] == ["example.com", "other.example"]
+    assert assets[0][1] == "https://example.com/a"  # first-seen URL represents the host
+
+
+def test_collect_assets_honours_the_asset_override():
+    assets = collect_assets(status_report(), asset_override="inventory-name")
+    assert [host for host, _ in assets] == ["inventory-name"]
+
+
+def test_upload_findings_adds_status_findings_only_when_asked():
+    off = upload_findings(status_report(), SecmanOptions(), FakeUploader())
+    on = upload_findings(
+        status_report(), SecmanOptions(status_findings=True), FakeUploader()
+    )
+
+    assert off.count("created") == 0
+    assert on.count("created") == 3
+
+
+def test_upload_findings_registers_assets_only_when_asked():
+    fake = FakeUploader()
+    summary = upload_findings(
+        status_report(),
+        SecmanOptions(register_assets=True, owner="team", asset_type="Web Service"),
+        fake,
+    )
+
+    assert [host for host, _, _, _ in fake.registered] == ["example.com", "dead.example"]
+    assert fake.registered[0][1] == "team"
+    assert fake.registered[0][3] == "Web Service"
+    assert [o.status for o in summary.asset_outcomes] == ["created", "created"]
+    assert summary.asset_failures == []
+
+
+def test_a_dry_run_plans_assets_without_writing_them():
+    fake = FakeUploader()
+    summary = upload_findings(
+        status_report(),
+        SecmanOptions(register_assets=True, dry_run=True, token="j"),
+        fake,
+    )
+
+    assert fake.registered == []
+    assert {o.status for o in summary.asset_outcomes} == {"planned"}
+
+
+def test_a_failed_asset_registration_is_recorded_not_raised():
+    fake = FakeUploader(fail_on={"dead.example"})
+    summary = upload_findings(
+        status_report(), SecmanOptions(register_assets=True), fake
+    )
+
+    assert [o.status for o in summary.asset_outcomes] == ["created", "failed"]
+    assert summary.asset_failures[0].hostname == "dead.example"
+
+
+def test_asset_outcomes_appear_in_the_summary_dict_and_printed_report():
+    import io
+
+    fake = FakeUploader()
+    summary = upload_findings(status_report(), SecmanOptions(register_assets=True), fake)
+    stream = io.StringIO()
+    write_upload_report(summary, stream)
+    out = stream.getvalue()
+
+    assert summary.to_dict()["assets"][0]["hostname"] == "example.com"
+    assert "[created] asset example.com" in out
+    assert "assets: 2 created" in out
+
+
+def test_http_uploader_registers_an_asset_through_the_import_endpoint():
+    seen = {}
+
+    def handler(request):
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"created": True, "asset": {"id": 7}})
+
+    uploader = http_uploader(handler, token="jwt")
+
+    status, detail = uploader.register_asset(
+        "example.com", "team", "https://example.com/", "Web Service"
+    )
+
+    assert seen["method"] == "PUT"
+    assert seen["path"] == "/api/assets/import"
+    assert seen["body"] == {
+        "name": "example.com",
+        "type": "Web Service",
+        "owner": "team",
+        "uri": "https://example.com/",
+    }
+    assert status == "created"
+    assert "asset id 7" in detail
+
+
+def test_http_uploader_reports_an_asset_rejection():
+    uploader = http_uploader(
+        lambda r: httpx.Response(403, json={"error": "no"}), token="jwt"
+    )
+
+    with pytest.raises(SecmanError, match="403"):
+        uploader.register_asset("example.com", "team", "https://example.com/", "Web Service")
+
+
+def test_http_uploader_reports_an_existing_asset_as_updated():
+    uploader = http_uploader(
+        lambda r: httpx.Response(200, json={"created": False, "asset": {"id": 7}}),
+        token="jwt",
+    )
+
+    status, _ = uploader.register_asset(
+        "example.com", "team", "https://example.com/", "Web Service"
+    )
+    assert status == "updated"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "secman-visual-check"
-version = "0.1.0"
+version = "0.2.0"
 description = "Screenshot URLs with a headless browser and check them for exposed critical content using a vision model."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+# Deliberately not part of `dev`: leaving the driver out of CI keeps the
+# "PyMySQL is missing" degradation path genuinely exercised.
+db = ["PyMySQL>=1.1"]
+# Only the SES transport needs boto3; SMTP is stdlib and O365 rides on httpx.
+aws = ["boto3>=1.34"]
 
 [project.scripts]
 secman-visual-check = "secman_visual_check.cli:main"

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from typing import TextIO
 
-from .models import ScanReport, ScanResult, Severity
+from .models import STATUS_STATES, ScanReport, ScanResult, Severity, UrlStatus
 
 SEVERITY_COLORS = {
     Severity.CRITICAL: "\033[1;97;41m",
@@ -28,11 +28,89 @@ SEVERITY_HEX = {
     Severity.INFO: "#6b7280",
 }
 
+STATUS_COLORS = {
+    "ok": "\033[32m",
+    "redirect": "\033[36m",
+    "redirect_broken": "\033[1;33m",
+    "unexpected_status": "\033[1;33m",
+    "client_error": "\033[1;31m",
+    "server_error": "\033[1;31m",
+    "unreachable": "\033[1;97;41m",
+    "unknown": "\033[90m",
+}
+
+STATUS_HEX = {
+    "ok": "#2f9e44",
+    "redirect": "#1c7ed6",
+    "redirect_broken": "#b7860b",
+    "unexpected_status": "#b7860b",
+    "client_error": "#d9480f",
+    "server_error": "#b3103c",
+    "unreachable": "#b3103c",
+    "unknown": "#6b7280",
+}
+
+#: Order the status summary is printed in — most alarming last is unhelpful in a
+#: terminal, so it reads best-to-worst.
+STATUS_DISPLAY_ORDER = (
+    "ok",
+    "redirect",
+    "redirect_broken",
+    "unexpected_status",
+    "client_error",
+    "server_error",
+    "unreachable",
+    "unknown",
+)
+
+
+def checksum_summary(status: UrlStatus) -> str:
+    """``sha256:1a2b3c4d…  4.2 KB  text/html`` — the short form used everywhere."""
+    if not status.content_checksum:
+        return ""
+    bits = [f"sha256:{status.content_checksum[:12]}"]
+    if status.content_length is not None:
+        bits.append(human_bytes(status.content_length) + (" (truncated)" if status.content_truncated else ""))
+    if status.content_type:
+        bits.append(status.content_type.split(";")[0].strip())
+    return "  ".join(bits)
+
+
+def human_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"  # pragma: no cover - unreachable, loop returns first
+
 
 def _paint(text: str, severity: Severity, color: bool) -> str:
     if not color:
         return text
     return f"{SEVERITY_COLORS[severity]}{text}{RESET}"
+
+
+def _paint_status(text: str, state: str, color: bool) -> str:
+    if not color:
+        return text
+    return f"{STATUS_COLORS.get(state, '')}{text}{RESET}"
+
+
+def status_detail(status: UrlStatus) -> str:
+    """The parenthesised suffix after a status label, or ``''``."""
+    if status.error:
+        return status.error
+    bits = []
+    if status.redirect_count:
+        hops = "hop" if status.redirect_count == 1 else "hops"
+        bits.append(f"{status.redirect_count} {hops}")
+    if not status.ok and status.final_status is not None:
+        expected = ", ".join(str(code) for code in status.expected_statuses)
+        bits.append(f"expected {expected}")
+    if status.elapsed_s:
+        bits.append(f"{status.elapsed_s:.2f}s")
+    return ", ".join(bits)
 
 
 def should_colorize(stream: TextIO, force: bool | None = None) -> bool:
@@ -67,6 +145,9 @@ def write_console_report(
         label = f"  {severity.value:<9} {counts[severity.value]}"
         print(_paint(label, severity, use_color) if counts[severity.value] else label, file=out)
 
+    if report.status_checked:
+        _write_status_summary(report, out, use_color)
+
     failures = report.failed
     if failures:
         print("", file=out)
@@ -76,11 +157,49 @@ def write_console_report(
             print(f"  {result.url} — {reason}", file=out)
 
 
+def _write_status_summary(report: ScanReport, out: TextIO, use_color: bool) -> None:
+    counts = report.status_counts()
+    print("", file=out)
+    print("Status checks:", file=out)
+    for state in STATUS_DISPLAY_ORDER:
+        count = counts.get(state, 0)
+        label = f"  {state:<18} {count}"
+        print(_paint_status(label, state, use_color) if count else label, file=out)
+
+    problems = report.status_failures
+    if not problems:
+        return
+    print("", file=out)
+    print(f"{len(problems)} target(s) did not return an expected status:", file=out)
+    for result in problems:
+        status = result.status_check
+        assert status is not None
+        reason = status.error or f"HTTP {status.final_status}"
+        print(f"  {result.url} — {reason}", file=out)
+
+
+def _write_status_line(status: UrlStatus, out: TextIO, use_color: bool) -> None:
+    detail = status_detail(status)
+    label = _paint_status(status.label, status.state, use_color)
+    print(f"  status: {label}" + (f"  ({detail})" if detail else ""), file=out)
+    if status.redirect_count:
+        for hop in status.chain:
+            arrow = f" -> {hop.location}" if hop.location else ""
+            print(f"    {hop.status} {hop.url}{arrow}", file=out)
+    if status.content_checksum:
+        print(f"  content: {checksum_summary(status)}", file=out)
+
+
 def _write_result(result: ScanResult, out: TextIO, use_color: bool, verbose: bool) -> None:
     severity = result.max_severity
     badge = _paint(f"[{severity.value.upper()}]", severity, use_color)
     print("", file=out)
     print(f"{badge} {result.url}", file=out)
+
+    # Printed before the skip/error returns: a target Chromium could not render
+    # still has a real HTTP status, and that is exactly when it is worth seeing.
+    if result.status_check is not None:
+        _write_status_line(result.status_check, out, use_color)
 
     if result.skipped_reason:
         print(f"  skipped: {result.skipped_reason}", file=out)
@@ -145,6 +264,17 @@ def render_html(report: ScanReport, base_dir: Path, embed_images: bool = True) -
         f'<span class="l">{html.escape(s.value)}</span></div>'
         for s in reversed(list(Severity))
     )
+    status_cards = ""
+    if report.status_checked:
+        status_counts = report.status_counts()
+        status_cards = '<div class="stats">' + "".join(
+            f'<div class="stat" style="--c:{STATUS_HEX[state]}">'
+            f'<span class="n">{status_counts.get(state, 0)}</span>'
+            f'<span class="l">{html.escape(state.replace("_", " "))}</span></div>'
+            for state in STATUS_DISPLAY_ORDER
+            if status_counts.get(state, 0)
+        ) + "</div>"
+
     sections = "\n".join(_render_result(r, base_dir, embed_images) for r in report.results)
 
     return f"""<!doctype html>
@@ -186,6 +316,11 @@ def render_html(report: ScanReport, base_dir: Path, embed_images: bool = True) -
   figure img {{ max-width:100%; height:auto; border:1px solid var(--line); border-radius:6px; display:block; }}
   figcaption {{ color:var(--muted); font-size:.8rem; margin-top:.35rem; }}
   .error {{ color:#d9480f; font-size:.9rem; }}
+  .status {{ display:inline-block; padding:.1rem .5rem; border-radius:4px; font-size:.72rem;
+             font-weight:700; text-transform:uppercase; color:#fff; margin-right:.5rem; }}
+  .chain {{ list-style:none; padding-left:0; margin:.35rem 0 .75rem;
+            font-size:.82rem; color:var(--muted); }}
+  .chain li {{ word-break:break-all; padding:.1rem 0; }}
   pre {{ overflow-x:auto; }}
 </style>
 </head>
@@ -198,6 +333,7 @@ def render_html(report: ScanReport, base_dir: Path, embed_images: bool = True) -
     started {html.escape(report.started_at.isoformat(timespec="seconds"))}
   </div>
   <div class="stats">{cards}</div>
+  {status_cards}
   {sections}
 </div>
 </body>
@@ -214,6 +350,9 @@ def _render_result(result: ScanResult, base_dir: Path, embed_images: bool) -> st
         f'<h2><span class="badge" style="background:{color}">{severity.value}</span>'
         f'<a href="{url}" rel="noreferrer noopener nofollow">{url}</a></h2>',
     ]
+
+    if result.status_check is not None:
+        parts.append(_render_status(result.status_check))
 
     if result.skipped_reason:
         parts.append(f'<p class="kv">Skipped: {html.escape(result.skipped_reason)}</p>')
@@ -273,6 +412,33 @@ def _render_result(result: ScanResult, base_dir: Path, embed_images: bool) -> st
 
     parts.append("</section>")
     return "\n".join(parts)
+
+
+def _render_status(status: UrlStatus) -> str:
+    """The status pill plus, when the target redirected, the chain.
+
+    Everything here is remote-controlled — the URL, the ``Location`` header and
+    the error text all come off the wire, so every one of them is escaped.
+    """
+    color = STATUS_HEX.get(status.state, STATUS_HEX["unknown"])
+    detail = status_detail(status)
+    parts = [
+        f'<p class="kv"><span class="status" style="background:{color}">'
+        f"{html.escape(status.label)}</span>"
+        + (html.escape(detail) if detail else "")
+        + "</p>"
+    ]
+    if status.redirect_count:
+        hops = "".join(
+            f"<li>{hop.status if hop.status is not None else '?'} {html.escape(hop.url)}"
+            + (f" &rarr; {html.escape(hop.location)}" if hop.location else "")
+            + "</li>"
+            for hop in status.chain
+        )
+        parts.append(f'<ol class="chain">{hops}</ol>')
+    if status.content_checksum:
+        parts.append(f'<p class="kv">{html.escape(checksum_summary(status))}</p>')
+    return "".join(parts)
 
 
 def _image_src(path: Path, base_dir: Path, embed: bool) -> str | None:

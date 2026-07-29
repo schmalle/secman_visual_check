@@ -13,6 +13,9 @@ from .analyzer import DEFAULT_BASE_URL, DEFAULT_MODEL, AnalyzerError, AnalyzerOp
 from .capture import CaptureOptions
 from .categories import load_categories
 from .config import ScanConfig
+from .mailer import DEFAULT_SUBJECT_PREFIX
+from .mailer import DEFAULT_TIMEOUT_S as MAIL_TIMEOUT_S
+from .mailer import TRANSPORTS, MailOptions, send_report, write_mail_report
 from .models import ScanResult, Severity
 from .reporting import (
     should_colorize,
@@ -20,8 +23,20 @@ from .reporting import (
     write_html_report,
     write_json_report,
 )
+from .db import (
+    DEFAULT_DB_NAME,
+    DEFAULT_TABLE_PREFIX,
+    DatabaseError,
+    DbOptions,
+    parse_flag,
+    set_flags,
+    store_report,
+    write_db_report,
+    write_flag_report,
+)
 from .scanner import run_scan
 from .secman import (
+    DEFAULT_ASSET_TYPE,
     DEFAULT_BACKEND_URL,
     DEFAULT_ID_PREFIX,
     DEFAULT_OWNER,
@@ -32,7 +47,12 @@ from .secman import (
     upload_findings,
     write_upload_report,
 )
-from .targets import TargetError, load_targets
+from .status import DEFAULT_CHECKSUM_MAX_BYTES
+from .status import DEFAULT_CONCURRENCY as DEFAULT_STATUS_CONCURRENCY
+from .status import DEFAULT_MAX_REDIRECTS
+from .status import DEFAULT_TIMEOUT_S as DEFAULT_STATUS_TIMEOUT_S
+from .status import StatusCheckOptions
+from .targets import TargetError, load_targets, normalize_url
 
 EXIT_OK = 0
 EXIT_FINDINGS = 1
@@ -95,6 +115,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     ai = parser.add_argument_group("analysis")
     ai.add_argument("--no-ai", action="store_true", help="capture screenshots only")
+    ai.add_argument(
+        "--no-visual-check",
+        dest="visual_check",
+        action="store_false",
+        default=True,
+        help="skip the browser entirely — no screenshots, no analysis. Leaves a "
+        "pure status/checksum check that needs no Chromium installed",
+    )
     ai.add_argument(
         "--api-key",
         default=None,
@@ -201,6 +229,74 @@ def build_parser() -> argparse.ArgumentParser:
     )
     browser.add_argument(
         "--browser-executable", metavar="PATH", help="path to a Chromium binary"
+    )
+
+    status = parser.add_argument_group(
+        "status check",
+        "Before the browser opens a target, ask a plain HTTP client what it "
+        "answers: 200, a redirect (and where to), an error, or nothing at all. "
+        "Redirects are walked by hand, so the first response is recorded verbatim "
+        "instead of being swallowed by the browser.",
+    )
+    status.add_argument(
+        "--no-status-check",
+        dest="status_check",
+        action="store_false",
+        default=True,
+        help="skip the HTTP status/redirect pre-check",
+    )
+    status.add_argument(
+        "--status-method",
+        choices=("auto", "head", "get"),
+        default="auto",
+        help="auto tries HEAD and falls back to GET where HEAD is refused (default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-timeout",
+        type=float,
+        default=DEFAULT_STATUS_TIMEOUT_S,
+        metavar="SECONDS",
+        help="status-check request timeout (default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-max-redirects",
+        type=int,
+        default=DEFAULT_MAX_REDIRECTS,
+        metavar="N",
+        help="redirect hops to follow, 0 to record only the first response (default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-expect",
+        default="200",
+        metavar="CODES",
+        help="statuses treated as OK, comma separated; 2xx-style wildcards allowed "
+        "(default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-concurrency",
+        type=int,
+        default=DEFAULT_STATUS_CONCURRENCY,
+        metavar="N",
+        help="parallel status checks (default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-checksum",
+        action="store_true",
+        help="hash the response body of targets that answer as expected, so a "
+        "later run can tell 'still up' from 'still up and unchanged' "
+        "(implied by --db-store)",
+    )
+    status.add_argument(
+        "--status-checksum-max-bytes",
+        type=int,
+        default=DEFAULT_CHECKSUM_MAX_BYTES,
+        metavar="N",
+        help="stop hashing a body after this many bytes (default: %(default)s)",
+    )
+    status.add_argument(
+        "--fail-on-status",
+        action="store_true",
+        help="exit 1 when any target's status check is not OK",
     )
 
     run = parser.add_argument_group("run control")
@@ -329,6 +425,184 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit non-zero when any finding could not be uploaded",
     )
+    secman.add_argument(
+        "--secman-status-findings",
+        action="store_true",
+        help="also upload a vulnerability for targets whose status check is not OK",
+    )
+    secman.add_argument(
+        "--secman-status-severity",
+        choices=("auto", "critical", "high", "medium", "low", "info"),
+        default="auto",
+        help="severity for status findings; auto uses the built-in mapping (default: %(default)s)",
+    )
+    secman.add_argument(
+        "--secman-register-assets",
+        action="store_true",
+        help="register every scanned host as a SecMan asset, even without findings "
+        "(http transport needs the ADMIN role)",
+    )
+    secman.add_argument(
+        "--secman-asset-type",
+        default=DEFAULT_ASSET_TYPE,
+        metavar="TYPE",
+        help="asset type recorded on registered assets (default: %(default)s)",
+    )
+
+    mail = parser.add_argument_group(
+        "email",
+        "Send the result as an email styled like SecMan's own notifications. "
+        "Transports: plain SMTP, Microsoft 365 (Graph sendMail) and AWS SES.",
+    )
+    mail.add_argument(
+        "--mail",
+        action="store_true",
+        help="email the results when the scan finishes (default: $SECMAN_MAIL)",
+    )
+    mail.add_argument(
+        "--mail-transport",
+        choices=TRANSPORTS,
+        default=None,
+        help="how to send (default: $SECMAN_MAIL_TRANSPORT or smtp)",
+    )
+    mail.add_argument(
+        "--mail-from",
+        default=None,
+        metavar="ADDRESS",
+        help="sender address (default: $SECMAN_MAIL_FROM)",
+    )
+    mail.add_argument(
+        "--mail-from-name",
+        default="SecMan Visual Check",
+        metavar="NAME",
+        help="sender display name (default: %(default)s)",
+    )
+    mail.add_argument(
+        "--mail-to",
+        action="append",
+        default=[],
+        metavar="ADDRESS",
+        help="recipient, repeatable (default: $SECMAN_MAIL_TO, comma separated)",
+    )
+    mail.add_argument(
+        "--mail-subject-prefix",
+        default=DEFAULT_SUBJECT_PREFIX,
+        metavar="TEXT",
+        help="prepended to the subject (default: %(default)s)",
+    )
+    mail.add_argument(
+        "--mail-always",
+        action="store_true",
+        help="send even when nothing is wrong; by default a clean run sends nothing",
+    )
+    mail.add_argument(
+        "--mail-dry-run",
+        action="store_true",
+        help="render the message and print the subject without delivering it",
+    )
+    mail.add_argument(
+        "--mail-dashboard-url",
+        default=None,
+        metavar="URL",
+        help="linked from the email's call-to-action button",
+    )
+    mail.add_argument(
+        "--mail-timeout",
+        type=float,
+        default=MAIL_TIMEOUT_S,
+        metavar="SECONDS",
+        help="delivery timeout (default: %(default)s)",
+    )
+    mail.add_argument("--mail-smtp-host", default=None, help="default: $SECMAN_MAIL_SMTP_HOST")
+    mail.add_argument(
+        "--mail-smtp-port", type=int, default=None, help="default: $SECMAN_MAIL_SMTP_PORT or 587"
+    )
+    mail.add_argument("--mail-smtp-user", default=None, help="default: $SECMAN_MAIL_SMTP_USER")
+    mail.add_argument(
+        "--mail-smtp-password", default=None, help="default: $SECMAN_MAIL_SMTP_PASSWORD"
+    )
+    mail.add_argument(
+        "--mail-smtp-no-tls",
+        dest="mail_smtp_tls",
+        action="store_false",
+        default=True,
+        help="do not issue STARTTLS",
+    )
+    mail.add_argument(
+        "--mail-smtp-ssl", action="store_true", help="connect with implicit TLS (port 465)"
+    )
+    mail.add_argument(
+        "--mail-tenant-id", default=None, metavar="ID", help="default: $SECMAN_MAIL_TENANT_ID"
+    )
+    mail.add_argument(
+        "--mail-client-id", default=None, metavar="ID", help="default: $SECMAN_MAIL_CLIENT_ID"
+    )
+    mail.add_argument(
+        "--mail-client-secret",
+        default=None,
+        metavar="SECRET",
+        help="default: $SECMAN_MAIL_CLIENT_SECRET",
+    )
+    mail.add_argument(
+        "--mail-aws-region",
+        default=None,
+        metavar="REGION",
+        help="SES region (default: $SECMAN_MAIL_AWS_REGION or $AWS_REGION)",
+    )
+    mail.add_argument(
+        "--mail-aws-profile",
+        default=None,
+        metavar="NAME",
+        help="named AWS profile to resolve SES credentials from (default: $AWS_PROFILE)",
+    )
+
+    db = parser.add_argument_group(
+        "database",
+        "Optionally mirror the status-check results into MariaDB. Needs the "
+        "driver: pip install 'secman-visual-check[db]'. See db/install.sh for "
+        "the schema and a least-privilege database user.",
+    )
+    db.add_argument(
+        "--db-store",
+        action="store_true",
+        help="store status-check results in MariaDB (default: $SECMAN_DB_STORE)",
+    )
+    db.add_argument(
+        "--db-url",
+        default=None,
+        metavar="URL",
+        help="mysql://user:pass@host:3306/dbname, overriding the individual "
+        "--db-* flags (default: $SECMAN_DB_URL)",
+    )
+    db.add_argument("--db-host", default=None, help="default: $SECMAN_DB_HOST or 127.0.0.1")
+    db.add_argument("--db-port", type=int, default=None, help="default: $SECMAN_DB_PORT or 3306")
+    db.add_argument("--db-user", default=None, help="default: $SECMAN_DB_USER")
+    db.add_argument("--db-password", default=None, help="default: $SECMAN_DB_PASSWORD")
+    db.add_argument(
+        "--db-name",
+        default=None,
+        help=f"default: $SECMAN_DB_NAME or {DEFAULT_DB_NAME}",
+    )
+    db.add_argument(
+        "--db-table-prefix",
+        default=DEFAULT_TABLE_PREFIX,
+        metavar="PREFIX",
+        help="table name prefix (default: %(default)s)",
+    )
+    db.add_argument(
+        "--db-fail-on-error",
+        action="store_true",
+        help="exit non-zero when the database write fails",
+    )
+    db.add_argument(
+        "--db-set-flag",
+        action="append",
+        default=[],
+        metavar="URL=FLAG",
+        help="flag a URL as OK, NEW or NOT_CHECKED and exit (no scan). Repeatable. "
+        "OK is the operator's verdict and is never set by a scan; it is cleared "
+        "automatically when the URL's content checksum changes",
+    )
     return parser
 
 
@@ -344,6 +618,57 @@ def parse_viewport(value: str) -> tuple[int, int]:
                 return width, height
             break
     raise argparse.ArgumentTypeError(f"invalid viewport {value!r}; expected e.g. 1440x900")
+
+
+def parse_status_list(value: str) -> tuple[int, ...]:
+    """Parse ``--status-expect``: ``200``, ``200,401`` or a wildcard like ``2xx``."""
+    codes: set[int] = set()
+    for raw in value.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if len(item) == 3 and item[0].isdigit() and item[1:] == "xx":
+            base = int(item[0]) * 100
+            if not 100 <= base <= 500:
+                raise argparse.ArgumentTypeError(f"invalid status wildcard {raw.strip()!r}")
+            codes.update(range(base, base + 100))
+            continue
+        if not item.isdigit():
+            raise argparse.ArgumentTypeError(
+                f"invalid status {raw.strip()!r}; expected e.g. 200, 200,401 or 2xx"
+            )
+        code = int(item)
+        if not 100 <= code <= 599:
+            raise argparse.ArgumentTypeError(f"status {code} is outside 100-599")
+        codes.add(code)
+    if not codes:
+        raise argparse.ArgumentTypeError("--status-expect needs at least one status code")
+    return tuple(sorted(codes))
+
+
+def parse_flag_assignments(raw: list[str]) -> list[tuple[str, str]]:
+    """Parse ``--db-set-flag URL=FLAG`` into ``[(normalised url, canonical flag)]``.
+
+    Split on the *last* ``=`` so query strings survive: ``?a=b=OK`` means the URL
+    is ``?a=b`` and the flag is ``OK``.
+    """
+    assignments: list[tuple[str, str]] = []
+    for item in raw:
+        url, sep, flag = item.rpartition("=")
+        if not sep or not url.strip() or not flag.strip():
+            raise argparse.ArgumentTypeError(
+                f"invalid --db-set-flag {item!r}; expected URL=FLAG, e.g. "
+                "https://example.com/=OK"
+            )
+        try:
+            normalised = normalize_url(url.strip())
+        except TargetError as exc:
+            raise argparse.ArgumentTypeError(f"invalid --db-set-flag {item!r}: {exc}") from exc
+        try:
+            assignments.append((normalised, parse_flag(flag)))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"invalid --db-set-flag {item!r}: {exc}") from exc
+    return assignments
 
 
 def parse_headers(raw: list[str]) -> dict[str, str]:
@@ -393,7 +718,8 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
     categories = load_categories(args.categories_file)
 
     analyzer: AnalyzerOptions | None = None
-    if not args.no_ai:
+    # No browser means no screenshot, and the model has nothing to look at.
+    if not args.no_ai and args.visual_check:
         instructions = args.instructions or ""
         if args.instructions_file:
             extra = Path(args.instructions_file).read_text(encoding="utf-8")
@@ -417,9 +743,35 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
             prompt_text_chars=max(0, args.prompt_text_chars),
         )
 
+    # Inherits the browser's timeout, user agent, headers, basic auth and
+    # --insecure, so the pre-check presents itself as the same client.
+    status_check = StatusCheckOptions.from_capture(
+        capture,
+        enabled=args.status_check,
+        method=args.status_method,
+        timeout_s=args.status_timeout,
+        max_redirects=max(0, args.status_max_redirects),
+        expect_statuses=parse_status_list(args.status_expect),
+        max_concurrency=max(1, args.status_concurrency),
+        # Database mode implies it: the whole point of the stored checksum is
+        # spotting content changes between runs, and there is nowhere else to
+        # keep one.
+        checksum=(
+            args.status_checksum or args.db_store or _env_flag("SECMAN_DB_STORE")
+        ),
+        checksum_max_bytes=max(0, args.status_checksum_max_bytes),
+    )
+
+    if not args.visual_check and not status_check.enabled:
+        raise ValueError(
+            "--no-visual-check and --no-status-check together leave nothing to do"
+        )
+
     return ScanConfig(
         output_dir=output_dir,
+        visual_check=args.visual_check,
         capture=capture,
+        status_check=status_check,
         analyzer=analyzer,
         categories=categories,
         concurrency=max(1, args.concurrency),
@@ -448,9 +800,92 @@ def build_secman_options(args: argparse.Namespace) -> SecmanOptions:
         allow_existing=args.secman_allow_existing,
         timeout=args.secman_timeout,
         verify_tls=not args.secman_insecure,
+        status_findings=args.secman_status_findings,
+        status_severity=(
+            None
+            if args.secman_status_severity == "auto"
+            else Severity(args.secman_status_severity)
+        ),
+        register_assets=args.secman_register_assets,
+        asset_type=args.secman_asset_type,
     )
     options.validate()
     return options
+
+
+def build_db_options(args: argparse.Namespace) -> DbOptions:
+    """Resolve the database flags against the environment, raising ValueError if unusable."""
+    enabled = args.db_store or _env_flag("SECMAN_DB_STORE")
+    url = args.db_url or os.environ.get("SECMAN_DB_URL")
+    overrides = {
+        "enabled": enabled,
+        "table_prefix": args.db_table_prefix,
+        "fail_on_error": args.db_fail_on_error,
+    }
+    if url:
+        options = DbOptions.from_url(url, **overrides)
+    else:
+        options = DbOptions(
+            host=args.db_host or os.environ.get("SECMAN_DB_HOST") or "127.0.0.1",
+            port=args.db_port or int(os.environ.get("SECMAN_DB_PORT") or 3306),
+            user=args.db_user or os.environ.get("SECMAN_DB_USER") or "",
+            password=args.db_password or os.environ.get("SECMAN_DB_PASSWORD") or "",
+            database=args.db_name or os.environ.get("SECMAN_DB_NAME") or DEFAULT_DB_NAME,
+            **overrides,
+        )
+    options.validate()
+    return options
+
+
+def build_mail_options(args: argparse.Namespace) -> MailOptions:
+    """Resolve the email flags against the environment, raising ValueError if unusable."""
+    recipients = list(args.mail_to)
+    if not recipients:
+        recipients = [
+            address.strip()
+            for address in (os.environ.get("SECMAN_MAIL_TO") or "").split(",")
+            if address.strip()
+        ]
+    options = MailOptions(
+        enabled=args.mail or _env_flag("SECMAN_MAIL"),
+        transport=(
+            args.mail_transport or os.environ.get("SECMAN_MAIL_TRANSPORT") or "smtp"
+        ),
+        sender=args.mail_from or os.environ.get("SECMAN_MAIL_FROM") or "",
+        sender_name=args.mail_from_name,
+        recipients=recipients,
+        subject_prefix=args.mail_subject_prefix,
+        always=args.mail_always,
+        timeout=args.mail_timeout,
+        dry_run=args.mail_dry_run,
+        smtp_host=args.mail_smtp_host or os.environ.get("SECMAN_MAIL_SMTP_HOST") or "",
+        smtp_port=args.mail_smtp_port
+        or int(os.environ.get("SECMAN_MAIL_SMTP_PORT") or 587),
+        smtp_user=args.mail_smtp_user or os.environ.get("SECMAN_MAIL_SMTP_USER") or "",
+        smtp_password=(
+            args.mail_smtp_password or os.environ.get("SECMAN_MAIL_SMTP_PASSWORD") or ""
+        ),
+        smtp_tls=args.mail_smtp_tls,
+        smtp_ssl=args.mail_smtp_ssl,
+        tenant_id=args.mail_tenant_id or os.environ.get("SECMAN_MAIL_TENANT_ID") or "",
+        client_id=args.mail_client_id or os.environ.get("SECMAN_MAIL_CLIENT_ID") or "",
+        client_secret=(
+            args.mail_client_secret or os.environ.get("SECMAN_MAIL_CLIENT_SECRET") or ""
+        ),
+        aws_region=(
+            args.mail_aws_region
+            or os.environ.get("SECMAN_MAIL_AWS_REGION")
+            or os.environ.get("AWS_REGION")
+            or ""
+        ),
+        aws_profile=args.mail_aws_profile or os.environ.get("AWS_PROFILE") or "",
+    )
+    options.validate()
+    return options
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _run_secman_upload(report, options: SecmanOptions, fail_on_error: bool) -> int:
@@ -461,7 +896,7 @@ def _run_secman_upload(report, options: SecmanOptions, fail_on_error: bool) -> i
         print(f"error: SecMan upload failed: {exc}", file=sys.stderr)
         return EXIT_ERROR
     write_upload_report(summary)
-    if summary.failures and fail_on_error:
+    if (summary.failures or summary.asset_failures) and fail_on_error:
         return EXIT_ERROR
     return EXIT_OK
 
@@ -478,7 +913,8 @@ def _progress_hook(quiet: bool):
             state = f"load failed: {result.capture.load_error}"
         else:
             state = result.max_severity.value
-        print(f"[{done}/{total}] {result.url} -> {state}", file=sys.stderr, flush=True)
+        prefix = f"{result.status_check.label} | " if result.status_check else ""
+        print(f"[{done}/{total}] {result.url} -> {prefix}{state}", file=sys.stderr, flush=True)
 
     return hook
 
@@ -498,6 +934,33 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_ERROR
     else:
         secman_options = None
+
+    try:
+        # Same rule as the SecMan credentials: fail before the scan, not after it.
+        db_options = build_db_options(args)
+        mail_options = build_mail_options(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
+
+    # Flagging URLs is a standalone command; there is nothing to scan.
+    if args.db_set_flag:
+        try:
+            assignments = parse_flag_assignments(args.db_set_flag)
+        except argparse.ArgumentTypeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        # Reuse the same credential rules as a storing run, whether or not
+        # --db-store was passed.
+        db_options.enabled = True
+        try:
+            db_options.validate()
+            changes = set_flags(assignments, db_options)
+        except (ValueError, DatabaseError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        write_flag_report(changes)
+        return EXIT_OK
 
     # Uploading a stored report is a standalone mode; there is nothing to scan.
     if args.secman_upload_report:
@@ -534,10 +997,14 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_ERROR
 
     if not args.quiet:
-        mode = "capture only" if config.analyzer is None else config.analyzer.model
+        if not config.visual_check:
+            workers = f"{config.status_check.max_concurrency} status worker(s)"
+            mode = "no browser (status check only)"
+        else:
+            workers = f"{config.concurrency} browser worker(s)"
+            mode = "capture only" if config.analyzer is None else config.analyzer.model
         print(
-            f"Scanning {len(targets)} target(s) with {config.concurrency} browser worker(s); "
-            f"analysis: {mode}",
+            f"Scanning {len(targets)} target(s) with {workers}; analysis: {mode}",
             file=sys.stderr,
         )
 
@@ -575,6 +1042,26 @@ def main(argv: list[str] | None = None) -> int:
         write_html_report(report, path, embed_images=not args.link_images)
         print(f"HTML report: {path}")
 
+    db_status = EXIT_OK
+    flag_changes: list = []
+    if db_options.enabled:
+        summary = store_report(report, db_options)
+        write_db_report(summary)
+        flag_changes = summary.flag_changes
+        if summary.error and db_options.fail_on_error:
+            db_status = EXIT_ERROR
+
+    if mail_options.enabled:
+        # After the database, so the email can report which URLs are new or
+        # changed — that is the part a human actually wants mailed.
+        mail_summary = send_report(
+            report,
+            mail_options,
+            flag_changes=flag_changes,
+            dashboard_url=args.mail_dashboard_url,
+        )
+        write_mail_report(mail_summary)
+
     upload_status = EXIT_OK
     if secman_options is not None:
         upload_status = _run_secman_upload(
@@ -584,7 +1071,9 @@ def main(argv: list[str] | None = None) -> int:
     if config.fail_on is not None and report.max_severity.rank >= config.fail_on.rank:
         if any(f.severity.rank >= config.fail_on.rank for r in report.results for f in r.findings):
             return EXIT_FINDINGS
-    return upload_status
+    if args.fail_on_status and report.status_failures:
+        return EXIT_FINDINGS
+    return upload_status or db_status
 
 
 if __name__ == "__main__":  # pragma: no cover

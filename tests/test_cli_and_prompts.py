@@ -3,8 +3,20 @@ import json
 import pytest
 
 from secman_visual_check.categories import DEFAULT_CATEGORIES, load_categories
-from secman_visual_check.cli import build_config, build_parser, main, parse_headers, parse_viewport
-from secman_visual_check.models import PageCapture, Severity
+from secman_visual_check.cli import (
+    _progress_hook,
+    build_config,
+    build_db_options,
+    build_mail_options,
+    build_parser,
+    build_secman_options,
+    main,
+    parse_flag_assignments,
+    parse_headers,
+    parse_status_list,
+    parse_viewport,
+)
+from secman_visual_check.models import PageCapture, ScanResult, Severity, UrlStatus
 from secman_visual_check.prompts import build_user_prompt
 
 
@@ -79,6 +91,190 @@ def test_browser_options_are_wired_through(tmp_path):
     assert config.capture.extra_headers == {"X-Env": "staging"}
 
 
+def test_parse_status_list_accepts_codes_and_wildcards():
+    assert parse_status_list("200") == (200,)
+    assert parse_status_list("200, 401") == (200, 401)
+    assert parse_status_list("2xx") == tuple(range(200, 300))
+    assert parse_status_list("200,200") == (200,)
+
+
+def test_parse_status_list_rejects_junk():
+    for value in ("nope", "", "99", "600", "9xx"):
+        with pytest.raises(Exception):
+            parse_status_list(value)
+
+
+def test_status_check_is_on_by_default(tmp_path):
+    config = build_config(parse(["https://example.com", "-o", str(tmp_path)]))
+
+    assert config.status_check.enabled is True
+    assert config.status_check.method == "auto"
+    assert config.status_check.expect_statuses == (200,)
+
+
+def test_no_status_check_disables_it(tmp_path):
+    config = build_config(
+        parse(["https://example.com", "--no-status-check", "-o", str(tmp_path)])
+    )
+    assert config.status_check.enabled is False
+
+
+def test_status_options_are_wired_through(tmp_path):
+    config = build_config(
+        parse(
+            [
+                "https://example.com",
+                "-o",
+                str(tmp_path),
+                "--status-method",
+                "get",
+                "--status-timeout",
+                "3.5",
+                "--status-max-redirects",
+                "2",
+                "--status-expect",
+                "200,401",
+                "--status-concurrency",
+                "16",
+            ]
+        )
+    )
+
+    assert config.status_check.method == "get"
+    assert config.status_check.timeout_s == 3.5
+    assert config.status_check.max_redirects == 2
+    assert config.status_check.expect_statuses == (200, 401)
+    assert config.status_check.max_concurrency == 16
+
+
+def test_the_status_check_inherits_the_browser_identity(tmp_path):
+    config = build_config(
+        parse(
+            [
+                "https://example.com",
+                "-o",
+                str(tmp_path),
+                "--insecure",
+                "--user-agent",
+                "scanner/1.0",
+                "-H",
+                "X-Env: staging",
+                "--basic-auth",
+                "user:pw",
+            ]
+        )
+    )
+
+    assert config.status_check.verify_tls is False
+    assert config.status_check.user_agent == "scanner/1.0"
+    assert config.status_check.extra_headers == {"X-Env": "staging"}
+    assert config.status_check.basic_auth == ("user", "pw")
+
+
+def test_progress_hook_prefixes_the_status(capsys):
+    hook = _progress_hook(quiet=False)
+    ok = ScanResult(
+        url="https://example.com/",
+        status_check=UrlStatus(url="https://example.com/", state="ok", first_status=200),
+    )
+    dead = ScanResult(
+        url="https://dead.example/",
+        status_check=UrlStatus(url="https://dead.example/", state="unreachable"),
+        error="TimeoutError",
+    )
+
+    hook(ok, 1, 2)
+    hook(dead, 2, 2)
+    err = capsys.readouterr().err
+
+    assert "[1/2] https://example.com/ -> 200 ok | info" in err
+    assert "[2/2] https://dead.example/ -> unreachable | error: TimeoutError" in err
+
+
+def test_progress_hook_without_a_status_check_is_unchanged(capsys):
+    _progress_hook(quiet=False)(ScanResult(url="https://example.com/"), 1, 1)
+
+    assert capsys.readouterr().err.strip() == "[1/1] https://example.com/ -> info"
+
+
+def test_secman_status_flags_reach_the_options():
+    options = build_secman_options(
+        parse(
+            [
+                "https://example.com",
+                "--secman-upload",
+                "--secman-dry-run",
+                "--secman-status-findings",
+                "--secman-status-severity",
+                "critical",
+                "--secman-register-assets",
+                "--secman-asset-type",
+                "Network Host",
+            ]
+        )
+    )
+
+    assert options.status_findings is True
+    assert options.status_severity is Severity.CRITICAL
+    assert options.register_assets is True
+    assert options.asset_type == "Network Host"
+
+
+def test_secman_status_severity_auto_means_the_built_in_mapping():
+    options = build_secman_options(
+        parse(["https://example.com", "--secman-upload", "--secman-dry-run"])
+    )
+    assert options.status_severity is None
+
+
+def test_db_options_default_to_disabled():
+    options = build_db_options(parse(["https://example.com"]))
+
+    assert options.enabled is False
+    assert options.table_prefix == "svc_"
+
+
+def test_db_url_is_parsed_and_flags_override_it():
+    options = build_db_options(
+        parse(
+            [
+                "https://example.com",
+                "--db-store",
+                "--db-url",
+                "mysql://scanner:pw@db.internal:3307/results",
+                "--db-table-prefix",
+                "scan_",
+                "--db-fail-on-error",
+            ]
+        )
+    )
+
+    assert options.enabled is True
+    assert (options.host, options.port) == ("db.internal", 3307)
+    assert options.database == "results"
+    assert options.table_prefix == "scan_"
+    assert options.fail_on_error is True
+
+
+def test_db_options_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SECMAN_DB_STORE", "1")
+    monkeypatch.setenv("SECMAN_DB_HOST", "db.example")
+    monkeypatch.setenv("SECMAN_DB_USER", "scanner")
+    monkeypatch.setenv("SECMAN_DB_NAME", "results")
+
+    options = build_db_options(parse(["https://example.com"]))
+
+    assert options.enabled is True
+    assert options.host == "db.example"
+    assert options.database == "results"
+
+
+def test_db_credentials_are_validated_before_the_scan(capsys):
+    # --db-store without a user is unusable; main must refuse before scanning.
+    assert main(["https://example.com", "--db-store", "--no-ai"]) == 2
+    assert "--db-user" in capsys.readouterr().err
+
+
 def test_dry_run_prints_targets_and_exits_ok(capsys):
     code = main(["example.com", "https://example.org/x", "--dry-run"])
     assert code == 0
@@ -146,3 +342,193 @@ def test_prompt_truncates_long_page_text():
     prompt = build_user_prompt(capture, DEFAULT_CATEGORIES, text_excerpt_chars=100)
     assert "x" * 100 in prompt
     assert "x" * 200 not in prompt
+
+
+# --------------------------------------------------------------------------- #
+# Skipping the visual check
+# --------------------------------------------------------------------------- #
+
+
+def test_visual_check_is_on_by_default(tmp_path):
+    config = build_config(parse(["https://example.com", "-o", str(tmp_path)]))
+    assert config.visual_check is True
+
+
+def test_no_visual_check_also_disables_the_analyzer(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    config = build_config(
+        parse(["https://example.com", "--no-visual-check", "-o", str(tmp_path)])
+    )
+
+    assert config.visual_check is False
+    # Nothing is screenshotted, so there is nothing for the model to look at.
+    assert config.analyzer is None
+    assert config.status_check.enabled is True
+
+
+def test_skipping_both_checks_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="nothing to do"):
+        build_config(
+            parse(
+                [
+                    "https://example.com",
+                    "--no-visual-check",
+                    "--no-status-check",
+                    "-o",
+                    str(tmp_path),
+                ]
+            )
+        )
+
+
+def test_skipping_both_checks_exits_before_scanning(capsys):
+    assert main(["https://example.com", "--no-visual-check", "--no-status-check"]) == 2
+    assert "nothing to do" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Checksums
+# --------------------------------------------------------------------------- #
+
+
+def test_checksum_is_off_by_default_and_opt_in(tmp_path):
+    off = build_config(parse(["https://example.com", "-o", str(tmp_path)]))
+    on = build_config(parse(["https://example.com", "--status-checksum", "-o", str(tmp_path)]))
+
+    assert off.status_check.checksum is False
+    assert on.status_check.checksum is True
+
+
+def test_database_mode_implies_the_checksum(tmp_path):
+    config = build_config(
+        parse(["https://example.com", "--db-store", "--db-user", "u", "-o", str(tmp_path)])
+    )
+    assert config.status_check.checksum is True
+
+
+def test_checksum_cap_is_configurable(tmp_path):
+    config = build_config(
+        parse(
+            [
+                "https://example.com",
+                "--status-checksum",
+                "--status-checksum-max-bytes",
+                "1024",
+                "-o",
+                str(tmp_path),
+            ]
+        )
+    )
+    assert config.status_check.checksum_max_bytes == 1024
+
+
+# --------------------------------------------------------------------------- #
+# URL flags
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_flag_assignments_normalises_url_and_flag():
+    assert parse_flag_assignments(["example.com=ok"]) == [("https://example.com/", "OK")]
+    assert parse_flag_assignments(["https://a.example/x=NOT CHECKED"]) == [
+        ("https://a.example/x", "NOT_CHECKED")
+    ]
+
+
+def test_parse_flag_assignments_splits_on_the_last_equals():
+    """A query string full of '=' must not confuse the URL/flag split."""
+    assert parse_flag_assignments(["https://a.example/?a=b=OK"]) == [
+        ("https://a.example/?a=b", "OK")
+    ]
+
+
+def test_parse_flag_assignments_rejects_junk():
+    for item in ("no-equals-sign", "=OK", "https://a.example/=", "https://a.example/=MAYBE"):
+        with pytest.raises(Exception):
+            parse_flag_assignments([item])
+
+
+def test_setting_a_flag_needs_database_credentials(capsys):
+    assert main(["--db-set-flag", "https://example.com/=OK"]) == 2
+    assert "--db-user" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# Email
+# --------------------------------------------------------------------------- #
+
+
+def test_mail_is_off_by_default():
+    assert build_mail_options(parse(["https://example.com"])).enabled is False
+
+
+def test_mail_options_are_wired_through():
+    options = build_mail_options(
+        parse(
+            [
+                "https://example.com",
+                "--mail",
+                "--mail-transport",
+                "o365",
+                "--mail-from",
+                "scanner@example.com",
+                "--mail-to",
+                "a@example.com",
+                "--mail-to",
+                "b@example.com",
+                "--mail-tenant-id",
+                "tid",
+                "--mail-client-id",
+                "cid",
+                "--mail-client-secret",
+                "sec",
+                "--mail-always",
+            ]
+        )
+    )
+
+    assert options.enabled is True
+    assert options.transport == "o365"
+    assert options.recipients == ["a@example.com", "b@example.com"]
+    assert options.always is True
+    assert options.tenant_id == "tid"
+
+
+def test_mail_recipients_can_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SECMAN_MAIL", "1")
+    monkeypatch.setenv("SECMAN_MAIL_FROM", "scanner@example.com")
+    monkeypatch.setenv("SECMAN_MAIL_TO", "a@example.com, b@example.com")
+    monkeypatch.setenv("SECMAN_MAIL_SMTP_HOST", "smtp.example.com")
+
+    options = build_mail_options(parse(["https://example.com"]))
+
+    assert options.enabled is True
+    assert options.recipients == ["a@example.com", "b@example.com"]
+    assert options.smtp_host == "smtp.example.com"
+
+
+def test_ses_region_falls_back_to_the_standard_aws_variable(monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "eu-central-1")
+
+    options = build_mail_options(
+        parse(
+            [
+                "https://example.com",
+                "--mail",
+                "--mail-transport",
+                "ses",
+                "--mail-from",
+                "s@example.com",
+                "--mail-to",
+                "o@example.com",
+            ]
+        )
+    )
+
+    assert options.aws_region == "eu-central-1"
+
+
+def test_mail_credentials_are_validated_before_the_scan(capsys):
+    code = main(["https://example.com", "--no-ai", "--mail", "--mail-from", "s@example.com"])
+
+    assert code == 2
+    assert "--mail-to" in capsys.readouterr().err

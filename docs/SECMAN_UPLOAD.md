@@ -9,6 +9,7 @@ a scan updates the rows it already created instead of piling up duplicates.
 - [Duplicate suppression](#duplicate-suppression)
 - [Dry-run mode](#dry-run-mode)
 - [Transports](#transports)
+- [Status findings and asset registration](#status-findings-and-asset-registration)
 - [All options](#all-options)
 - [Exit codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
@@ -181,6 +182,67 @@ be enabled on the key itself.
 `--secman-url` takes the backend root for both transports; `/mcp` is appended
 automatically, and a URL that already ends in `/mcp` is left alone.
 
+## Status findings and asset registration
+
+Two opt-in extras, both driven by the
+[status check](STATUS_CHECK.md) rather than by the model.
+
+### `--secman-status-findings`
+
+A target that does not answer as expected becomes an ordinary vulnerability, so
+it rides the same de-duplication, existing-ID pre-check and dry-run paths as
+everything else. Healthy targets — `ok` and `redirect` — produce nothing.
+
+| status state | category | severity |
+| --- | --- | --- |
+| `unreachable` | `unreachable` | high |
+| `server_error` (5xx) | `unexpected_status` | high |
+| `client_error` (4xx) | `unexpected_status` | medium |
+| `unexpected_status` (unasked-for 1xx/2xx) | `unexpected_status` | medium |
+| `redirect_broken` | `broken_redirect` | medium |
+
+IDs come from the same `vulnerability_id()` as every other finding, so they are
+stable across runs by construction:
+`SECMAN-VISUAL-UNREACHABLE-<hash>`, `SECMAN-VISUAL-UNEXPECTED-STATUS-<hash>`.
+`--secman-min-severity` still applies; `--secman-status-severity` overrides the
+whole table with one value.
+
+```bash
+python -m secman_visual_check --secman-upload --secman-status-findings \
+  --secman-min-severity medium -f urls.txt
+```
+
+### `--secman-register-assets`
+
+Puts every scanned host in SecMan's asset inventory, whether or not it has
+findings — useful when the scan *is* the discovery step.
+
+- **http transport** uses `PUT /api/assets/import`, SecMan's idempotent upsert
+  for external scanners: it matches on name, merges, and preserves
+  operator-set fields, so re-scanning never mints a second asset. It requires
+  the **ADMIN** role; without it each registration is reported as `failed` and
+  the findings upload continues regardless.
+- **mcp transport** uses the `create_asset` tool, which is not an upsert, so a
+  rejection naming an existing asset is reported as `skipped`.
+
+One row per distinct host, not per page. The asset is named after the host
+(or `--secman-asset-name`), owned by `--secman-owner`, typed by
+`--secman-asset-type`, with the first URL seen on that host recorded as its URI.
+
+Output looks like:
+
+```
+  [created] asset example.com  https://example.com/admin
+      asset id 41
+
+SecMan: 2 created, 0 updated, 0 planned, 0 skipped, 0 failed
+  assets: 1 created
+```
+
+Note that findings alone already cause SecMan to auto-create assets from the
+`owner` field on `cli-add`. `--secman-register-assets` is for the hosts that
+have *no* findings and would otherwise never appear.
+
 ## All options
 
 | Flag | Environment | Default | Effect |
@@ -202,7 +264,11 @@ automatically, and a URL that already ends in `/mcp` is left alone.
 | `--secman-allow-existing` | | off | Re-send findings SecMan already holds |
 | `--secman-timeout SECONDS` | | `30` | Per-request timeout |
 | `--secman-insecure` | | off | Ignore TLS errors (internal CAs) |
-| `--secman-fail-on-error` | | off | Exit non-zero if any upload failed |
+| `--secman-fail-on-error` | | off | Exit non-zero if any upload or asset registration failed |
+| `--secman-status-findings` | | off | Also upload targets whose status check is not OK |
+| `--secman-status-severity` | | `auto` | Severity for status findings; `auto` uses the mapping below |
+| `--secman-register-assets` | | off | Register every scanned host as an asset (http needs ADMIN) |
+| `--secman-asset-type TYPE` | | `Web Service` | Asset type recorded on registered assets |
 
 `SECMAN_API_KEY` is **not** used here — that variable is the vision model's API
 key. The MCP key has its own variable, `SECMAN_MCP_API_KEY`.

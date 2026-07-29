@@ -9,12 +9,17 @@ from .analyzer import AnalyzerOptions
 from .capture import CaptureOptions
 from .categories import Category
 from .models import Severity
+from .status import StatusCheckOptions
 
 
 @dataclass
 class ScanConfig:
     output_dir: Path
+    #: When False the browser is never launched: no screenshots, no analysis.
+    #: The scan degrades to a pure status/checksum check.
+    visual_check: bool = True
     capture: CaptureOptions = field(default_factory=CaptureOptions)
+    status_check: StatusCheckOptions = field(default_factory=StatusCheckOptions)
     analyzer: AnalyzerOptions | None = None
     categories: list[Category] = field(default_factory=list)
     concurrency: int = 4
