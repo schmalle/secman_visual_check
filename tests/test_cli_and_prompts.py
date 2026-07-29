@@ -3,8 +3,18 @@ import json
 import pytest
 
 from secman_visual_check.categories import DEFAULT_CATEGORIES, load_categories
-from secman_visual_check.cli import build_config, build_parser, main, parse_headers, parse_viewport
-from secman_visual_check.models import PageCapture, Severity
+from secman_visual_check.cli import (
+    _progress_hook,
+    build_config,
+    build_db_options,
+    build_parser,
+    build_secman_options,
+    main,
+    parse_headers,
+    parse_status_list,
+    parse_viewport,
+)
+from secman_visual_check.models import PageCapture, ScanResult, Severity, UrlStatus
 from secman_visual_check.prompts import build_user_prompt
 
 
@@ -77,6 +87,190 @@ def test_browser_options_are_wired_through(tmp_path):
     assert config.capture.ignore_https_errors is True
     assert config.capture.basic_auth == ("user", "pw")
     assert config.capture.extra_headers == {"X-Env": "staging"}
+
+
+def test_parse_status_list_accepts_codes_and_wildcards():
+    assert parse_status_list("200") == (200,)
+    assert parse_status_list("200, 401") == (200, 401)
+    assert parse_status_list("2xx") == tuple(range(200, 300))
+    assert parse_status_list("200,200") == (200,)
+
+
+def test_parse_status_list_rejects_junk():
+    for value in ("nope", "", "99", "600", "9xx"):
+        with pytest.raises(Exception):
+            parse_status_list(value)
+
+
+def test_status_check_is_on_by_default(tmp_path):
+    config = build_config(parse(["https://example.com", "-o", str(tmp_path)]))
+
+    assert config.status_check.enabled is True
+    assert config.status_check.method == "auto"
+    assert config.status_check.expect_statuses == (200,)
+
+
+def test_no_status_check_disables_it(tmp_path):
+    config = build_config(
+        parse(["https://example.com", "--no-status-check", "-o", str(tmp_path)])
+    )
+    assert config.status_check.enabled is False
+
+
+def test_status_options_are_wired_through(tmp_path):
+    config = build_config(
+        parse(
+            [
+                "https://example.com",
+                "-o",
+                str(tmp_path),
+                "--status-method",
+                "get",
+                "--status-timeout",
+                "3.5",
+                "--status-max-redirects",
+                "2",
+                "--status-expect",
+                "200,401",
+                "--status-concurrency",
+                "16",
+            ]
+        )
+    )
+
+    assert config.status_check.method == "get"
+    assert config.status_check.timeout_s == 3.5
+    assert config.status_check.max_redirects == 2
+    assert config.status_check.expect_statuses == (200, 401)
+    assert config.status_check.max_concurrency == 16
+
+
+def test_the_status_check_inherits_the_browser_identity(tmp_path):
+    config = build_config(
+        parse(
+            [
+                "https://example.com",
+                "-o",
+                str(tmp_path),
+                "--insecure",
+                "--user-agent",
+                "scanner/1.0",
+                "-H",
+                "X-Env: staging",
+                "--basic-auth",
+                "user:pw",
+            ]
+        )
+    )
+
+    assert config.status_check.verify_tls is False
+    assert config.status_check.user_agent == "scanner/1.0"
+    assert config.status_check.extra_headers == {"X-Env": "staging"}
+    assert config.status_check.basic_auth == ("user", "pw")
+
+
+def test_progress_hook_prefixes_the_status(capsys):
+    hook = _progress_hook(quiet=False)
+    ok = ScanResult(
+        url="https://example.com/",
+        status_check=UrlStatus(url="https://example.com/", state="ok", first_status=200),
+    )
+    dead = ScanResult(
+        url="https://dead.example/",
+        status_check=UrlStatus(url="https://dead.example/", state="unreachable"),
+        error="TimeoutError",
+    )
+
+    hook(ok, 1, 2)
+    hook(dead, 2, 2)
+    err = capsys.readouterr().err
+
+    assert "[1/2] https://example.com/ -> 200 ok | info" in err
+    assert "[2/2] https://dead.example/ -> unreachable | error: TimeoutError" in err
+
+
+def test_progress_hook_without_a_status_check_is_unchanged(capsys):
+    _progress_hook(quiet=False)(ScanResult(url="https://example.com/"), 1, 1)
+
+    assert capsys.readouterr().err.strip() == "[1/1] https://example.com/ -> info"
+
+
+def test_secman_status_flags_reach_the_options():
+    options = build_secman_options(
+        parse(
+            [
+                "https://example.com",
+                "--secman-upload",
+                "--secman-dry-run",
+                "--secman-status-findings",
+                "--secman-status-severity",
+                "critical",
+                "--secman-register-assets",
+                "--secman-asset-type",
+                "Network Host",
+            ]
+        )
+    )
+
+    assert options.status_findings is True
+    assert options.status_severity is Severity.CRITICAL
+    assert options.register_assets is True
+    assert options.asset_type == "Network Host"
+
+
+def test_secman_status_severity_auto_means_the_built_in_mapping():
+    options = build_secman_options(
+        parse(["https://example.com", "--secman-upload", "--secman-dry-run"])
+    )
+    assert options.status_severity is None
+
+
+def test_db_options_default_to_disabled():
+    options = build_db_options(parse(["https://example.com"]))
+
+    assert options.enabled is False
+    assert options.table_prefix == "svc_"
+
+
+def test_db_url_is_parsed_and_flags_override_it():
+    options = build_db_options(
+        parse(
+            [
+                "https://example.com",
+                "--db-store",
+                "--db-url",
+                "mysql://scanner:pw@db.internal:3307/results",
+                "--db-table-prefix",
+                "scan_",
+                "--db-fail-on-error",
+            ]
+        )
+    )
+
+    assert options.enabled is True
+    assert (options.host, options.port) == ("db.internal", 3307)
+    assert options.database == "results"
+    assert options.table_prefix == "scan_"
+    assert options.fail_on_error is True
+
+
+def test_db_options_come_from_the_environment(monkeypatch):
+    monkeypatch.setenv("SECMAN_DB_STORE", "1")
+    monkeypatch.setenv("SECMAN_DB_HOST", "db.example")
+    monkeypatch.setenv("SECMAN_DB_USER", "scanner")
+    monkeypatch.setenv("SECMAN_DB_NAME", "results")
+
+    options = build_db_options(parse(["https://example.com"]))
+
+    assert options.enabled is True
+    assert options.host == "db.example"
+    assert options.database == "results"
+
+
+def test_db_credentials_are_validated_before_the_scan(capsys):
+    # --db-store without a user is unusable; main must refuse before scanning.
+    assert main(["https://example.com", "--db-store", "--no-ai"]) == 2
+    assert "--db-user" in capsys.readouterr().err
 
 
 def test_dry_run_prints_targets_and_exits_ok(capsys):

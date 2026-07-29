@@ -5,11 +5,16 @@ Checker for web pages.
 Give it a URL (or a list of them). It loads each page in a headless browser,
 takes a screenshot, and asks a vision model whether the page exposes content
 that should not be reachable — credentials, unauthenticated admin panels,
-directory listings, personal data, stack traces, and so on. You get a console
-summary, a machine-readable JSON report, and a self-contained HTML report with
-the screenshots embedded. Findings can also be pushed straight into
-[SecMan](https://github.com/schmalle/secman) — see
-[Uploading findings to SecMan](#uploading-findings-to-secman).
+directory listings, personal data, stack traces, and so on. Before the browser
+opens a target it also asks a plain HTTP client what the URL actually answers:
+200, a redirect (and where to), an error, or nothing at all — see
+[Status and redirect checks](#status-and-redirect-checks).
+
+You get a console summary, a machine-readable JSON report, and a self-contained
+HTML report with the screenshots embedded. Findings can also be pushed straight
+into [SecMan](https://github.com/schmalle/secman) — see
+[Uploading findings to SecMan](#uploading-findings-to-secman) — and status
+results can be mirrored into MariaDB, see [db/README.md](db/README.md).
 
 > **Scan only systems you own or are explicitly authorised to test.** The tool
 > loads pages and sends screenshots to a third-party model provider; both are
@@ -54,6 +59,56 @@ scan-output/
 ├── report.json
 └── report.html
 ```
+
+## Status and redirect checks
+
+Every target gets an HTTP status check before the browser touches it. It runs on
+by default and needs no configuration:
+
+```
+[2/4] http://old.example.com/ -> 301->200 redirect (1 hop) | info
+
+[INFO] http://old.example.com/
+  status: 301->200 redirect  (1 hop, 0.34s)
+    301 http://old.example.com/ -> /new
+    200 https://old.example.com/new
+```
+
+This is a **separate request**, not a reuse of the browser's navigation. The
+browser follows redirects internally, answers from its cache, runs service
+workers and honours storage state, so it can only ever tell you where a target
+*ended up*. The check walks the chain by hand with redirects disabled, so the
+first response — and every `Location` after it — is recorded verbatim. That is
+what a non-browser client actually sees. Both statuses appear side by side in
+the report; a divergence between them is itself worth looking at.
+
+Each target ends in one state:
+
+| state | meaning |
+| --- | --- |
+| `ok` | answered an expected status (200 by default), no redirects |
+| `redirect` | redirected, and the end of the chain was expected |
+| `redirect_broken` | redirect loop, hop cap reached, or a `Location` that cannot be followed |
+| `unexpected_status` | a 1xx/2xx nobody asked for, e.g. 204 where 200 was expected |
+| `client_error` | 4xx |
+| `server_error` | 5xx |
+| `unreachable` | DNS, TLS, connection or timeout failure |
+
+```bash
+# Treat 401 as healthy too — an authenticated endpoint should refuse anonymous callers
+python -m secman_visual_check --status-expect 200,401 https://api.example.com/private
+
+# Record the first response and do not follow it
+python -m secman_visual_check --status-max-redirects 0 http://example.com
+
+# Fail the build when anything is not answering as expected
+python -m secman_visual_check --fail-on-status -f urls.txt
+
+# Turn it off
+python -m secman_visual_check --no-status-check https://example.com
+```
+
+Full reference: [docs/STATUS_CHECK.md](docs/STATUS_CHECK.md).
 
 ## What it looks at
 
@@ -212,6 +267,8 @@ Severity maps onto SecMan's four levels (`info` folds into `LOW`), and
 | `--secman-min-severity`, `--secman-owner`, `--secman-id-prefix`, `--secman-asset-name` | How findings are mapped |
 | `--secman-allow-existing` | Re-send findings SecMan already holds |
 | `--secman-fail-on-error` | Exit non-zero when an upload fails |
+| `--secman-status-findings`, `--secman-status-severity` | Also upload targets whose status check failed |
+| `--secman-register-assets`, `--secman-asset-type` | Put every scanned host in SecMan's asset inventory |
 
 Environment defaults: `SECMAN_URL`, `SECMAN_TOKEN`, `SECMAN_USERNAME`,
 `SECMAN_PASSWORD`, `SECMAN_MCP_API_KEY`, `SECMAN_MCP_USER_EMAIL`. Note that
@@ -232,6 +289,10 @@ troubleshooting: [docs/SECMAN_UPLOAD.md](docs/SECMAN_UPLOAD.md).
 | `--respect-robots` | Skip URLs the origin's `robots.txt` disallows. Off by default: you are scanning your own assets. |
 | `--link-images` | Link screenshots from the HTML report instead of embedding them, for large scans. |
 | `--include-raw` | Keep the raw model replies in the JSON report, for debugging prompts. |
+| `--no-status-check` | Skip the HTTP status/redirect pre-check. |
+| `--status-expect 200,401`, `--status-max-redirects`, `--status-method`, `--status-timeout`, `--status-concurrency` | Tune the status check. See [docs/STATUS_CHECK.md](docs/STATUS_CHECK.md). |
+| `--fail-on-status` | Exit 1 when any target's status check is not OK. |
+| `--db-store`, `--db-url`, `--db-*` | Mirror the status results into MariaDB. See [db/README.md](db/README.md). |
 | `-v/--verbose` | Print evidence and remediation for every finding. |
 
 Full list: `python -m secman_visual_check --help`.
@@ -244,11 +305,29 @@ Full list: `python -m secman_visual_check --help`.
   "model": "anthropic/claude-sonnet-4.5",
   "target_count": 2,
   "severity_counts": {"critical": 1, "high": 1, "medium": 0, "low": 0, "info": 0},
+  "status_counts": {"ok": 1, "redirect": 1, "redirect_broken": 0,
+                    "unexpected_status": 0, "client_error": 0, "server_error": 0,
+                    "unreachable": 0, "unknown": 0},
   "max_severity": "critical",
   "results": [
     {
       "url": "https://example.com/backup/",
       "max_severity": "critical",
+      "status_check": {
+        "state": "ok",
+        "ok": true,
+        "method": "HEAD",
+        "first_status": 200,
+        "final_status": 200,
+        "final_url": "https://example.com/backup/",
+        "redirect_count": 0,
+        "expected_statuses": [200],
+        "chain": [{"url": "https://example.com/backup/", "status": 200, "location": null,
+                   "elapsed_s": 0.021}],
+        "error": null,
+        "elapsed_s": 0.021,
+        "checked_at": "2026-07-29T09:14:02.113000+00:00"
+      },
       "capture": {"status": 200, "title": "Index of /backup", "screenshot_path": "..."},
       "analysis": {
         "risk_level": "critical",
@@ -270,8 +349,11 @@ Full list: `python -m secman_visual_check --help`.
 }
 ```
 
-Pages that fail to load still appear, with `capture.load_error` set. A page that
-only rendered the browser's own error screen is never sent to the model.
+Pages that fail to load still appear, with `capture.load_error` set — and with
+their `status_check` intact, since it runs before the browser and does not
+depend on it. A page that only rendered the browser's own error screen is never
+sent to the model. `status_check` is `null` when the check is disabled or the
+target was skipped by `robots.txt`.
 
 ## How it fits together
 
@@ -279,12 +361,14 @@ only rendered the browser's own error screen is never sent to the model.
 | --- | --- |
 | `targets.py` | Parse, normalise and de-duplicate URLs |
 | `capture.py` | Playwright: navigate, screenshot, extract title/text/status |
+| `status.py` | HTTP status/redirect pre-check, walked hop by hop |
 | `categories.py` | The policy — what counts as critical content |
 | `prompts.py` | System prompt, user prompt, and the response JSON schema |
 | `analyzer.py` | OpenAI-compatible vision call, retries, lenient JSON parsing |
 | `scanner.py` | Pipelines capture → analysis with independent concurrency limits |
 | `reporting.py` | Console, JSON and HTML output |
 | `secman.py` | Maps findings onto SecMan vulnerabilities; HTTP and MCP upload |
+| `db.py` | Optional MariaDB mirror of the status results |
 | `cli.py` | Argument parsing and exit codes |
 
 ## Caveats

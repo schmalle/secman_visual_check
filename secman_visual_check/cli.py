@@ -20,8 +20,16 @@ from .reporting import (
     write_html_report,
     write_json_report,
 )
+from .db import (
+    DEFAULT_DB_NAME,
+    DEFAULT_TABLE_PREFIX,
+    DbOptions,
+    store_report,
+    write_db_report,
+)
 from .scanner import run_scan
 from .secman import (
+    DEFAULT_ASSET_TYPE,
     DEFAULT_BACKEND_URL,
     DEFAULT_ID_PREFIX,
     DEFAULT_OWNER,
@@ -32,6 +40,10 @@ from .secman import (
     upload_findings,
     write_upload_report,
 )
+from .status import DEFAULT_CONCURRENCY as DEFAULT_STATUS_CONCURRENCY
+from .status import DEFAULT_MAX_REDIRECTS
+from .status import DEFAULT_TIMEOUT_S as DEFAULT_STATUS_TIMEOUT_S
+from .status import StatusCheckOptions
 from .targets import TargetError, load_targets
 
 EXIT_OK = 0
@@ -203,6 +215,60 @@ def build_parser() -> argparse.ArgumentParser:
         "--browser-executable", metavar="PATH", help="path to a Chromium binary"
     )
 
+    status = parser.add_argument_group(
+        "status check",
+        "Before the browser opens a target, ask a plain HTTP client what it "
+        "answers: 200, a redirect (and where to), an error, or nothing at all. "
+        "Redirects are walked by hand, so the first response is recorded verbatim "
+        "instead of being swallowed by the browser.",
+    )
+    status.add_argument(
+        "--no-status-check",
+        dest="status_check",
+        action="store_false",
+        default=True,
+        help="skip the HTTP status/redirect pre-check",
+    )
+    status.add_argument(
+        "--status-method",
+        choices=("auto", "head", "get"),
+        default="auto",
+        help="auto tries HEAD and falls back to GET where HEAD is refused (default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-timeout",
+        type=float,
+        default=DEFAULT_STATUS_TIMEOUT_S,
+        metavar="SECONDS",
+        help="status-check request timeout (default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-max-redirects",
+        type=int,
+        default=DEFAULT_MAX_REDIRECTS,
+        metavar="N",
+        help="redirect hops to follow, 0 to record only the first response (default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-expect",
+        default="200",
+        metavar="CODES",
+        help="statuses treated as OK, comma separated; 2xx-style wildcards allowed "
+        "(default: %(default)s)",
+    )
+    status.add_argument(
+        "--status-concurrency",
+        type=int,
+        default=DEFAULT_STATUS_CONCURRENCY,
+        metavar="N",
+        help="parallel status checks (default: %(default)s)",
+    )
+    status.add_argument(
+        "--fail-on-status",
+        action="store_true",
+        help="exit 1 when any target's status check is not OK",
+    )
+
     run = parser.add_argument_group("run control")
     run.add_argument("-c", "--concurrency", type=int, default=4, help="parallel page loads (default: %(default)s)")
     run.add_argument(
@@ -329,6 +395,68 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="exit non-zero when any finding could not be uploaded",
     )
+    secman.add_argument(
+        "--secman-status-findings",
+        action="store_true",
+        help="also upload a vulnerability for targets whose status check is not OK",
+    )
+    secman.add_argument(
+        "--secman-status-severity",
+        choices=("auto", "critical", "high", "medium", "low", "info"),
+        default="auto",
+        help="severity for status findings; auto uses the built-in mapping (default: %(default)s)",
+    )
+    secman.add_argument(
+        "--secman-register-assets",
+        action="store_true",
+        help="register every scanned host as a SecMan asset, even without findings "
+        "(http transport needs the ADMIN role)",
+    )
+    secman.add_argument(
+        "--secman-asset-type",
+        default=DEFAULT_ASSET_TYPE,
+        metavar="TYPE",
+        help="asset type recorded on registered assets (default: %(default)s)",
+    )
+
+    db = parser.add_argument_group(
+        "database",
+        "Optionally mirror the status-check results into MariaDB. Needs the "
+        "driver: pip install 'secman-visual-check[db]'. See db/install.sh for "
+        "the schema and a least-privilege database user.",
+    )
+    db.add_argument(
+        "--db-store",
+        action="store_true",
+        help="store status-check results in MariaDB (default: $SECMAN_DB_STORE)",
+    )
+    db.add_argument(
+        "--db-url",
+        default=None,
+        metavar="URL",
+        help="mysql://user:pass@host:3306/dbname, overriding the individual "
+        "--db-* flags (default: $SECMAN_DB_URL)",
+    )
+    db.add_argument("--db-host", default=None, help="default: $SECMAN_DB_HOST or 127.0.0.1")
+    db.add_argument("--db-port", type=int, default=None, help="default: $SECMAN_DB_PORT or 3306")
+    db.add_argument("--db-user", default=None, help="default: $SECMAN_DB_USER")
+    db.add_argument("--db-password", default=None, help="default: $SECMAN_DB_PASSWORD")
+    db.add_argument(
+        "--db-name",
+        default=None,
+        help=f"default: $SECMAN_DB_NAME or {DEFAULT_DB_NAME}",
+    )
+    db.add_argument(
+        "--db-table-prefix",
+        default=DEFAULT_TABLE_PREFIX,
+        metavar="PREFIX",
+        help="table name prefix (default: %(default)s)",
+    )
+    db.add_argument(
+        "--db-fail-on-error",
+        action="store_true",
+        help="exit non-zero when the database write fails",
+    )
     return parser
 
 
@@ -344,6 +472,32 @@ def parse_viewport(value: str) -> tuple[int, int]:
                 return width, height
             break
     raise argparse.ArgumentTypeError(f"invalid viewport {value!r}; expected e.g. 1440x900")
+
+
+def parse_status_list(value: str) -> tuple[int, ...]:
+    """Parse ``--status-expect``: ``200``, ``200,401`` or a wildcard like ``2xx``."""
+    codes: set[int] = set()
+    for raw in value.split(","):
+        item = raw.strip().lower()
+        if not item:
+            continue
+        if len(item) == 3 and item[0].isdigit() and item[1:] == "xx":
+            base = int(item[0]) * 100
+            if not 100 <= base <= 500:
+                raise argparse.ArgumentTypeError(f"invalid status wildcard {raw.strip()!r}")
+            codes.update(range(base, base + 100))
+            continue
+        if not item.isdigit():
+            raise argparse.ArgumentTypeError(
+                f"invalid status {raw.strip()!r}; expected e.g. 200, 200,401 or 2xx"
+            )
+        code = int(item)
+        if not 100 <= code <= 599:
+            raise argparse.ArgumentTypeError(f"status {code} is outside 100-599")
+        codes.add(code)
+    if not codes:
+        raise argparse.ArgumentTypeError("--status-expect needs at least one status code")
+    return tuple(sorted(codes))
 
 
 def parse_headers(raw: list[str]) -> dict[str, str]:
@@ -417,9 +571,22 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
             prompt_text_chars=max(0, args.prompt_text_chars),
         )
 
+    # Inherits the browser's timeout, user agent, headers, basic auth and
+    # --insecure, so the pre-check presents itself as the same client.
+    status_check = StatusCheckOptions.from_capture(
+        capture,
+        enabled=args.status_check,
+        method=args.status_method,
+        timeout_s=args.status_timeout,
+        max_redirects=max(0, args.status_max_redirects),
+        expect_statuses=parse_status_list(args.status_expect),
+        max_concurrency=max(1, args.status_concurrency),
+    )
+
     return ScanConfig(
         output_dir=output_dir,
         capture=capture,
+        status_check=status_check,
         analyzer=analyzer,
         categories=categories,
         concurrency=max(1, args.concurrency),
@@ -448,9 +615,45 @@ def build_secman_options(args: argparse.Namespace) -> SecmanOptions:
         allow_existing=args.secman_allow_existing,
         timeout=args.secman_timeout,
         verify_tls=not args.secman_insecure,
+        status_findings=args.secman_status_findings,
+        status_severity=(
+            None
+            if args.secman_status_severity == "auto"
+            else Severity(args.secman_status_severity)
+        ),
+        register_assets=args.secman_register_assets,
+        asset_type=args.secman_asset_type,
     )
     options.validate()
     return options
+
+
+def build_db_options(args: argparse.Namespace) -> DbOptions:
+    """Resolve the database flags against the environment, raising ValueError if unusable."""
+    enabled = args.db_store or _env_flag("SECMAN_DB_STORE")
+    url = args.db_url or os.environ.get("SECMAN_DB_URL")
+    overrides = {
+        "enabled": enabled,
+        "table_prefix": args.db_table_prefix,
+        "fail_on_error": args.db_fail_on_error,
+    }
+    if url:
+        options = DbOptions.from_url(url, **overrides)
+    else:
+        options = DbOptions(
+            host=args.db_host or os.environ.get("SECMAN_DB_HOST") or "127.0.0.1",
+            port=args.db_port or int(os.environ.get("SECMAN_DB_PORT") or 3306),
+            user=args.db_user or os.environ.get("SECMAN_DB_USER") or "",
+            password=args.db_password or os.environ.get("SECMAN_DB_PASSWORD") or "",
+            database=args.db_name or os.environ.get("SECMAN_DB_NAME") or DEFAULT_DB_NAME,
+            **overrides,
+        )
+    options.validate()
+    return options
+
+
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _run_secman_upload(report, options: SecmanOptions, fail_on_error: bool) -> int:
@@ -461,7 +664,7 @@ def _run_secman_upload(report, options: SecmanOptions, fail_on_error: bool) -> i
         print(f"error: SecMan upload failed: {exc}", file=sys.stderr)
         return EXIT_ERROR
     write_upload_report(summary)
-    if summary.failures and fail_on_error:
+    if (summary.failures or summary.asset_failures) and fail_on_error:
         return EXIT_ERROR
     return EXIT_OK
 
@@ -478,7 +681,8 @@ def _progress_hook(quiet: bool):
             state = f"load failed: {result.capture.load_error}"
         else:
             state = result.max_severity.value
-        print(f"[{done}/{total}] {result.url} -> {state}", file=sys.stderr, flush=True)
+        prefix = f"{result.status_check.label} | " if result.status_check else ""
+        print(f"[{done}/{total}] {result.url} -> {prefix}{state}", file=sys.stderr, flush=True)
 
     return hook
 
@@ -498,6 +702,13 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_ERROR
     else:
         secman_options = None
+
+    try:
+        db_options = build_db_options(args)
+    except ValueError as exc:
+        # Same rule as the SecMan credentials: fail before the scan, not after it.
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_ERROR
 
     # Uploading a stored report is a standalone mode; there is nothing to scan.
     if args.secman_upload_report:
@@ -575,6 +786,13 @@ def main(argv: list[str] | None = None) -> int:
         write_html_report(report, path, embed_images=not args.link_images)
         print(f"HTML report: {path}")
 
+    db_status = EXIT_OK
+    if db_options.enabled:
+        summary = store_report(report, db_options)
+        write_db_report(summary)
+        if summary.error and db_options.fail_on_error:
+            db_status = EXIT_ERROR
+
     upload_status = EXIT_OK
     if secman_options is not None:
         upload_status = _run_secman_upload(
@@ -584,7 +802,9 @@ def main(argv: list[str] | None = None) -> int:
     if config.fail_on is not None and report.max_severity.rank >= config.fail_on.rank:
         if any(f.severity.rank >= config.fail_on.rank for r in report.results for f in r.findings):
             return EXIT_FINDINGS
-    return upload_status
+    if args.fail_on_status and report.status_failures:
+        return EXIT_FINDINGS
+    return upload_status or db_status
 
 
 if __name__ == "__main__":  # pragma: no cover

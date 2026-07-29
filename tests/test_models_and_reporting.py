@@ -1,14 +1,21 @@
+import io
 import json
 
 from secman_visual_check.models import (
     Analysis,
     Finding,
     PageCapture,
+    RedirectHop,
     ScanReport,
     ScanResult,
     Severity,
+    UrlStatus,
 )
-from secman_visual_check.reporting import render_html, write_json_report
+from secman_visual_check.reporting import (
+    render_html,
+    write_console_report,
+    write_json_report,
+)
 
 
 def make_report() -> ScanReport:
@@ -43,10 +50,42 @@ def make_report() -> ScanReport:
             ),
         ],
     )
-    report = ScanReport(model="test/model", tool_version="0.1.0")
+    redirect = UrlStatus(
+        url="https://example.com/admin",
+        state="redirect",
+        method="HEAD",
+        first_status=301,
+        final_status=200,
+        final_url="https://example.com/admin/",
+        elapsed_s=0.34,
+        chain=[
+            RedirectHop(
+                url="https://example.com/admin",
+                status=301,
+                # A Location is attacker-controlled, so it must be escaped.
+                location='/admin/"><script>alert("x")</script>',
+            ),
+            RedirectHop(url="https://example.com/admin/", status=200),
+        ],
+    )
+    unreachable = UrlStatus(
+        url="https://broken.example/",
+        state="unreachable",
+        error="ConnectError: Name or service not known",
+    )
+    report = ScanReport(model="test/model", tool_version="0.2.0")
     report.results = [
-        ScanResult(url="https://example.com/admin", capture=capture, analysis=analysis),
-        ScanResult(url="https://broken.example/", error="net::ERR_NAME_NOT_RESOLVED"),
+        ScanResult(
+            url="https://example.com/admin",
+            capture=capture,
+            status_check=redirect,
+            analysis=analysis,
+        ),
+        ScanResult(
+            url="https://broken.example/",
+            status_check=unreachable,
+            error="net::ERR_NAME_NOT_RESOLVED",
+        ),
     ]
     return report
 
@@ -111,3 +150,93 @@ def test_html_embeds_screenshot_when_present(tmp_path):
 
     linked = render_html(report, tmp_path, embed_images=False)
     assert 'src="shot.png"' in linked
+
+
+def test_report_aggregates_status_checks():
+    report = make_report()
+
+    counts = report.status_counts()
+    assert counts["redirect"] == 1
+    assert counts["unreachable"] == 1
+    assert counts["ok"] == 0
+    assert report.status_checked is True
+    # The redirect landed on 200, so only the unreachable target is a failure.
+    assert [r.url for r in report.status_failures] == ["https://broken.example/"]
+
+
+def test_json_report_carries_the_status_check(tmp_path):
+    path = write_json_report(make_report(), tmp_path / "report.json")
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    status = data["results"][0]["status_check"]
+    assert status["state"] == "redirect"
+    assert status["ok"] is True
+    assert status["first_status"] == 301
+    assert status["final_status"] == 200
+    assert status["redirect_count"] == 1
+    assert [hop["status"] for hop in status["chain"]] == [301, 200]
+    assert data["status_counts"]["redirect"] == 1
+    assert data["results"][1]["status_check"]["state"] == "unreachable"
+
+
+def test_json_report_omits_the_status_check_when_it_did_not_run(tmp_path):
+    report = make_report()
+    for result in report.results:
+        result.status_check = None
+
+    data = json.loads(
+        write_json_report(report, tmp_path / "report.json").read_text(encoding="utf-8")
+    )
+
+    assert data["results"][0]["status_check"] is None
+    assert data["status_counts"]["ok"] == 0
+
+
+def test_html_shows_the_status_pill_and_the_redirect_chain(tmp_path):
+    html_out = render_html(make_report(), tmp_path, embed_images=True)
+
+    assert "301-&gt;200 redirect" in html_out
+    assert '<ol class="chain">' in html_out
+    assert "unreachable" in html_out
+
+
+def test_html_escapes_the_location_header(tmp_path):
+    html_out = render_html(make_report(), tmp_path, embed_images=True)
+
+    assert '"><script>alert' not in html_out
+    assert "&lt;script&gt;alert" in html_out
+
+
+def test_html_omits_the_status_block_when_no_check_ran(tmp_path):
+    report = make_report()
+    for result in report.results:
+        result.status_check = None
+
+    html_out = render_html(report, tmp_path, embed_images=True)
+
+    assert '<span class="status"' not in html_out
+    assert '<ol class="chain">' not in html_out
+
+
+def test_console_report_prints_the_status_line_and_summary():
+    stream = io.StringIO()
+    write_console_report(make_report(), stream=stream, color=False)
+    out = stream.getvalue()
+
+    assert "status: 301->200 redirect" in out
+    assert "1 hop" in out
+    assert "status: unreachable" in out
+    assert "Status checks:" in out
+    assert "1 target(s) did not return an expected status:" in out
+    assert "ConnectError: Name or service not known" in out
+
+
+def test_console_report_omits_the_status_block_when_no_check_ran():
+    report = make_report()
+    for result in report.results:
+        result.status_check = None
+    stream = io.StringIO()
+
+    write_console_report(report, stream=stream, color=False)
+
+    assert "Status checks:" not in stream.getvalue()

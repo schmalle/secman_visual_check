@@ -8,7 +8,8 @@ import pytest
 from secman_visual_check import scanner
 from secman_visual_check.analyzer import AnalyzerOptions
 from secman_visual_check.config import ScanConfig
-from secman_visual_check.models import Analysis, PageCapture, Severity
+from secman_visual_check.models import Analysis, PageCapture, Severity, UrlStatus
+from secman_visual_check.status import StatusCheckOptions
 
 
 class FakeCapturer:
@@ -41,6 +42,26 @@ class FakeCapturer:
         return PageCapture(url=url, status=200, screenshot_path=f"/tmp/{len(self.seen)}.png")
 
 
+class FakeChecker:
+    instances: list["FakeChecker"] = []
+
+    def __init__(self, options, client=None):
+        self.options = options
+        self.checked: list[str] = []
+        FakeChecker.instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def check(self, url):
+        self.checked.append(url)
+        await asyncio.sleep(0)
+        return UrlStatus(url=url, state="ok", first_status=200, final_status=200)
+
+
 class FakeAnalyzer:
     def __init__(self, options, categories):
         self.options = options
@@ -64,6 +85,7 @@ class FakeAnalyzer:
 @pytest.fixture
 def patched(monkeypatch):
     FakeCapturer.instances.clear()
+    FakeChecker.instances.clear()
     created: dict[str, FakeAnalyzer] = {}
 
     def make_analyzer(options, categories):
@@ -73,6 +95,7 @@ def patched(monkeypatch):
 
     monkeypatch.setattr(scanner, "BrowserCapturer", FakeCapturer)
     monkeypatch.setattr(scanner, "VisionAnalyzer", make_analyzer)
+    monkeypatch.setattr(scanner, "UrlStatusChecker", FakeChecker)
     return created
 
 
@@ -151,3 +174,49 @@ def test_empty_target_list_returns_an_empty_report(tmp_path):
 def test_screenshots_go_into_a_subdirectory(patched, tmp_path):
     asyncio.run(scanner.run_scan(["https://a.example/"], make_config(tmp_path)))
     assert FakeCapturer.instances[0].output_dir == tmp_path / "screenshots"
+
+
+def test_every_target_gets_a_status_check(patched, tmp_path):
+    targets = ["https://a.example/", "https://b.example/"]
+    report = asyncio.run(scanner.run_scan(targets, make_config(tmp_path)))
+
+    assert sorted(FakeChecker.instances[0].checked) == targets
+    assert [r.status_check.state for r in report.results] == ["ok", "ok"]
+    assert report.status_counts()["ok"] == 2
+    assert report.status_checked is True
+    assert report.status_failures == []
+
+
+def test_disabling_the_status_check_never_constructs_a_checker(patched, tmp_path):
+    config = make_config(tmp_path, status_check=StatusCheckOptions(enabled=False))
+    report = asyncio.run(scanner.run_scan(["https://a.example/"], config))
+
+    assert FakeChecker.instances == []
+    assert report.results[0].status_check is None
+    assert report.status_checked is False
+
+
+def test_a_robots_skipped_target_is_never_touched_by_the_status_check(
+    patched, tmp_path, monkeypatch
+):
+    class DenyAll:
+        async def allowed(self, url):
+            return "allowed" in url
+
+    monkeypatch.setattr(scanner, "RobotsCache", lambda: DenyAll())
+    targets = ["https://allowed.example/", "https://denied.example/"]
+    report = asyncio.run(
+        scanner.run_scan(targets, make_config(tmp_path, respect_robots=True))
+    )
+
+    assert FakeChecker.instances[0].checked == ["https://allowed.example/"]
+    assert report.results[1].status_check is None
+
+
+def test_the_status_check_still_records_a_target_the_browser_could_not_load(
+    patched, tmp_path
+):
+    report = asyncio.run(scanner.run_scan(["https://broken.example/"], make_config(tmp_path)))
+
+    assert report.results[0].capture.load_error
+    assert report.results[0].status_check.state == "ok"

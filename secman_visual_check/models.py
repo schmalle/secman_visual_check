@@ -137,6 +137,96 @@ class PageCapture:
         }
 
 
+#: Outcomes of the HTTP status pre-check, worst-to-best ordering is not implied.
+STATUS_STATES = (
+    "ok",
+    "redirect",
+    "redirect_broken",
+    "unexpected_status",
+    "client_error",
+    "server_error",
+    "unreachable",
+    "unknown",
+)
+
+
+@dataclass
+class RedirectHop:
+    """One response in a redirect chain."""
+
+    url: str
+    status: int | None = None
+    #: The raw ``Location`` header, exactly as sent — may be relative.
+    location: str | None = None
+    elapsed_s: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "status": self.status,
+            "location": self.location,
+            "elapsed_s": round(self.elapsed_s, 3),
+        }
+
+
+@dataclass
+class UrlStatus:
+    """What a plain HTTP client sees at a target URL.
+
+    Deliberately separate from :class:`PageCapture`: the browser follows redirects
+    internally, uses its cache and runs service workers, so ``PageCapture.status``
+    only ever shows the end of the story. This records the first response verbatim
+    and every hop after it.
+    """
+
+    url: str
+    state: str = "unknown"
+    #: The method that produced ``first_status`` — ``HEAD`` or ``GET``.
+    method: str = ""
+    first_status: int | None = None
+    final_status: int | None = None
+    final_url: str | None = None
+    chain: list[RedirectHop] = field(default_factory=list)
+    expected_statuses: tuple[int, ...] = (200,)
+    error: str | None = None
+    elapsed_s: float = 0.0
+    checked_at: datetime = field(default_factory=utcnow)
+
+    @property
+    def ok(self) -> bool:
+        return self.final_status is not None and self.final_status in self.expected_statuses
+
+    @property
+    def redirect_count(self) -> int:
+        return max(0, len(self.chain) - 1)
+
+    @property
+    def label(self) -> str:
+        """A short human-readable verdict, shared by every renderer."""
+        if self.first_status is None:
+            return self.state
+        if self.redirect_count and self.final_status is not None:
+            return f"{self.first_status}->{self.final_status} {self.state}"
+        return f"{self.first_status} {self.state}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "state": self.state,
+            "ok": self.ok,
+            "method": self.method,
+            "first_status": self.first_status,
+            "final_status": self.final_status,
+            "final_url": self.final_url,
+            "redirect_count": self.redirect_count,
+            "expected_statuses": list(self.expected_statuses),
+            "chain": [hop.to_dict() for hop in self.chain],
+            "error": self.error,
+            "elapsed_s": round(self.elapsed_s, 3),
+            "checked_at": self.checked_at.isoformat(),
+        }
+
+
 @dataclass
 class Analysis:
     """The verdict returned by the vision model for one screenshot."""
@@ -177,6 +267,7 @@ class ScanResult:
 
     url: str
     capture: PageCapture | None = None
+    status_check: UrlStatus | None = None
     analysis: Analysis | None = None
     error: str | None = None
     skipped_reason: str | None = None
@@ -199,6 +290,7 @@ class ScanResult:
             "error": self.error,
             "skipped_reason": self.skipped_reason,
             "max_severity": self.max_severity.value,
+            "status_check": self.status_check.to_dict() if self.status_check else None,
             "capture": self.capture.to_dict() if self.capture else None,
             "analysis": self.analysis.to_dict(include_raw) if self.analysis else None,
         }
@@ -236,6 +328,21 @@ class ScanReport:
     def failed(self) -> list[ScanResult]:
         return [r for r in self.results if r.error or (r.capture and r.capture.load_error)]
 
+    def status_counts(self) -> dict[str, int]:
+        counts = {state: 0 for state in STATUS_STATES}
+        for result in self.results:
+            if result.status_check is not None:
+                counts[result.status_check.state] = counts.get(result.status_check.state, 0) + 1
+        return counts
+
+    @property
+    def status_checked(self) -> bool:
+        return any(r.status_check is not None for r in self.results)
+
+    @property
+    def status_failures(self) -> list[ScanResult]:
+        return [r for r in self.results if r.status_check is not None and not r.status_check.ok]
+
     def to_dict(self, include_raw: bool = False) -> dict[str, Any]:
         return {
             "tool": "secman_visual_check",
@@ -246,6 +353,7 @@ class ScanReport:
             "duration_s": round(self.duration_s, 3),
             "target_count": len(self.results),
             "severity_counts": self.severity_counts(),
+            "status_counts": self.status_counts(),
             "max_severity": self.max_severity.value,
             "results": [r.to_dict(include_raw) for r in self.results],
         }

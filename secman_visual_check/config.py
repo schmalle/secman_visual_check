@@ -9,12 +9,14 @@ from .analyzer import AnalyzerOptions
 from .capture import CaptureOptions
 from .categories import Category
 from .models import Severity
+from .status import StatusCheckOptions
 
 
 @dataclass
 class ScanConfig:
     output_dir: Path
     capture: CaptureOptions = field(default_factory=CaptureOptions)
+    status_check: StatusCheckOptions = field(default_factory=StatusCheckOptions)
     analyzer: AnalyzerOptions | None = None
     categories: list[Category] = field(default_factory=list)
     concurrency: int = 4

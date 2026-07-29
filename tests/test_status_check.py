@@ -1,0 +1,372 @@
+"""The HTTP status/redirect pre-check: the walk, the classification, the fallbacks."""
+
+import asyncio
+
+import httpx
+import pytest
+
+from secman_visual_check.capture import CaptureOptions
+from secman_visual_check.status import StatusCheckOptions, UrlStatusChecker
+
+
+def run_check(handler, url="https://example.com/", **option_overrides):
+    """Drive UrlStatusChecker.check against a mocked transport."""
+    options = StatusCheckOptions(**option_overrides)
+
+    async def main():
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+            auth=options.basic_auth,
+            headers=_client_headers(options),
+        )
+        async with UrlStatusChecker(options, client=client) as checker:
+            try:
+                return await checker.check(url)
+            finally:
+                await client.aclose()
+
+    return asyncio.run(main())
+
+
+def _client_headers(options):
+    headers = dict(options.extra_headers)
+    if options.user_agent:
+        headers["User-Agent"] = options.user_agent
+    return headers
+
+
+def responder(routes, default=404):
+    """A handler answering from a ``{url: (status, location)}`` table."""
+
+    def handler(request):
+        status, location = routes.get(str(request.url), (default, None))
+        headers = {"Location": location} if location else {}
+        return httpx.Response(status, headers=headers)
+
+    return handler
+
+
+def test_plain_200_is_ok_with_a_single_chain_entry():
+    status = run_check(responder({"https://example.com/": (200, None)}))
+
+    assert status.state == "ok"
+    assert status.ok is True
+    assert status.first_status == 200
+    assert status.final_status == 200
+    assert status.redirect_count == 0
+    assert len(status.chain) == 1
+    assert status.label == "200 ok"
+
+
+def test_redirect_records_the_raw_first_status_and_the_final_one():
+    status = run_check(
+        responder(
+            {
+                "http://old.example.com/": (301, "https://old.example.com/"),
+                "https://old.example.com/": (200, None),
+            }
+        ),
+        url="http://old.example.com/",
+    )
+
+    assert status.state == "redirect"
+    assert status.ok is True
+    assert status.first_status == 301
+    assert status.final_status == 200
+    assert status.final_url == "https://old.example.com/"
+    assert status.redirect_count == 1
+    assert status.chain[0].location == "https://old.example.com/"
+    assert status.label == "301->200 redirect"
+
+
+def test_relative_location_is_resolved_against_the_current_url():
+    status = run_check(
+        responder(
+            {
+                "https://example.com/old": (302, "/new"),
+                "https://example.com/new": (200, None),
+            }
+        ),
+        url="https://example.com/old",
+    )
+
+    assert status.final_url == "https://example.com/new"
+    assert status.state == "redirect"
+
+
+def test_chain_longer_than_the_cap_is_reported_as_broken():
+    routes = {f"https://example.com/{i}": (302, f"/{i + 1}") for i in range(10)}
+    status = run_check(routes and responder(routes), url="https://example.com/0", max_redirects=2)
+
+    assert status.state == "redirect_broken"
+    assert status.ok is False
+    assert "stopped after 2" in status.error
+    # Two hops followed, plus the third response that ended it.
+    assert len(status.chain) == 3
+
+
+def test_redirect_loop_is_detected_rather_than_followed_forever():
+    status = run_check(
+        responder(
+            {
+                "https://example.com/a": (302, "https://example.com/b"),
+                "https://example.com/b": (302, "https://example.com/a"),
+            }
+        ),
+        url="https://example.com/a",
+    )
+
+    assert status.state == "redirect_broken"
+    assert "redirect loop" in status.error
+
+
+def test_redirect_to_a_non_http_scheme_stops_the_walk():
+    status = run_check(responder({"https://example.com/": (302, "ftp://example.com/x")}))
+
+    assert status.state == "redirect_broken"
+    assert status.ok is False
+    assert "non-HTTP" in status.error
+
+
+def test_redirect_to_an_unparseable_location_stops_the_walk():
+    # httpx builds the redirect request eagerly, so these never come back as a
+    # response at all — the checker has to recognise the exception instead.
+    for location in ("mailto:someone@example.com", "javascript:alert(1)"):
+        status = run_check(responder({"https://example.com/": (302, location)}))
+
+        assert status.state == "redirect_broken", location
+        assert "unusable redirect target" in status.error
+
+
+def test_a_non_http_target_is_rejected_before_any_request_is_made():
+    def handler(request):  # pragma: no cover - must never run
+        raise AssertionError("no request should be sent")
+
+    status = run_check(handler, url="ftp://example.com/file")
+
+    assert status.state == "unreachable"
+    assert "not an HTTP(S) URL" in status.error
+
+
+def test_redirect_without_a_location_header_is_broken():
+    status = run_check(responder({"https://example.com/": (301, None)}))
+
+    assert status.state == "redirect_broken"
+    assert "without a Location" in status.error
+
+
+def test_client_and_server_errors_are_classified_separately():
+    missing = run_check(responder({"https://example.com/": (404, None)}))
+    down = run_check(responder({"https://example.com/": (503, None)}))
+
+    assert missing.state == "client_error"
+    assert down.state == "server_error"
+    assert missing.ok is False and down.ok is False
+
+
+def test_a_2xx_nobody_asked_for_is_not_called_ok():
+    status = run_check(responder({"https://example.com/": (204, None)}))
+
+    assert status.state == "unexpected_status"
+    assert status.ok is False
+    assert status.label == "204 unexpected_status"
+
+
+def test_status_expect_widens_what_counts_as_ok():
+    status = run_check(
+        responder({"https://example.com/": (401, None)}),
+        expect_statuses=(200, 401),
+    )
+
+    assert status.state == "ok"
+    assert status.ok is True
+
+
+def test_max_redirects_zero_records_the_first_response_without_calling_it_broken():
+    status = run_check(
+        responder({"https://example.com/": (301, "https://example.com/new")}),
+        max_redirects=0,
+    )
+
+    assert status.state == "redirect"
+    assert status.ok is False
+    assert status.error is None
+    assert len(status.chain) == 1
+
+
+def test_transport_failure_becomes_unreachable_and_never_propagates():
+    def handler(request):
+        raise httpx.ConnectError("Name or service not known", request=request)
+
+    status = run_check(handler)
+
+    assert status.state == "unreachable"
+    assert status.ok is False
+    assert "ConnectError" in status.error
+
+
+def test_head_falls_back_to_get_when_the_server_refuses_head():
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        if request.method == "HEAD":
+            return httpx.Response(405)
+        return httpx.Response(200)
+
+    status = run_check(handler)
+
+    assert seen == ["HEAD", "GET"]
+    assert status.method == "GET"
+    assert status.state == "ok"
+
+
+def test_method_get_never_issues_a_head():
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        return httpx.Response(200)
+
+    status = run_check(handler, method="get")
+
+    assert seen == ["GET"]
+    assert status.method == "GET"
+
+
+def test_method_head_never_falls_back():
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        return httpx.Response(405)
+
+    status = run_check(handler, method="head")
+
+    assert seen == ["HEAD"]
+    assert status.state == "client_error"
+    assert status.final_status == 405
+
+
+def test_303_switches_the_rest_of_the_chain_to_get():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, str(request.url)))
+        if str(request.url).endswith("/form"):
+            return httpx.Response(303, headers={"Location": "/result"})
+        return httpx.Response(200)
+
+    run_check(handler, url="https://example.com/form")
+
+    assert seen[0][0] == "HEAD"
+    assert seen[1] == ("GET", "https://example.com/result")
+
+
+def test_headers_user_agent_and_basic_auth_reach_the_request():
+    seen = {}
+
+    def handler(request):
+        seen["ua"] = request.headers.get("user-agent")
+        seen["custom"] = request.headers.get("x-scan")
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200)
+
+    run_check(
+        handler,
+        user_agent="secman-scanner/1.0",
+        extra_headers={"X-Scan": "yes"},
+        basic_auth=("alice", "hunter2"),
+    )
+
+    assert seen["ua"] == "secman-scanner/1.0"
+    assert seen["custom"] == "yes"
+    assert seen["auth"].startswith("Basic ")
+
+
+def test_from_capture_inherits_the_browser_identity():
+    capture = CaptureOptions(
+        timeout_ms=45_000,
+        user_agent="browser/1.0",
+        extra_headers={"X-Env": "staging"},
+        basic_auth=("bob", "pw"),
+        ignore_https_errors=True,
+    )
+
+    options = StatusCheckOptions.from_capture(capture, enabled=False, method="get")
+
+    assert options.timeout_s == 45.0
+    assert options.user_agent == "browser/1.0"
+    assert options.extra_headers == {"X-Env": "staging"}
+    assert options.basic_auth == ("bob", "pw")
+    assert options.verify_tls is False
+    assert options.enabled is False
+    assert options.method == "get"
+
+
+def test_from_capture_rejects_an_unknown_override():
+    with pytest.raises(TypeError):
+        StatusCheckOptions.from_capture(CaptureOptions(), nonsense=True)
+
+
+def test_concurrency_is_capped_by_max_concurrency():
+    in_flight = 0
+    peak = 0
+
+    async def handler(request):
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        await asyncio.sleep(0.01)
+        in_flight -= 1
+        return httpx.Response(200)
+
+    options = StatusCheckOptions(max_concurrency=2)
+
+    async def main():
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), follow_redirects=False
+        )
+        async with UrlStatusChecker(options, client=client) as checker:
+            try:
+                await asyncio.gather(
+                    *(checker.check(f"https://example.com/{i}") for i in range(6))
+                )
+            finally:
+                await client.aclose()
+
+    asyncio.run(main())
+
+    assert peak <= 2
+
+
+def test_to_dict_carries_the_chain_and_the_verdict():
+    status = run_check(
+        responder(
+            {
+                "https://example.com/a": (301, "/b"),
+                "https://example.com/b": (200, None),
+            }
+        ),
+        url="https://example.com/a",
+    )
+
+    payload = status.to_dict()
+
+    assert payload["state"] == "redirect"
+    assert payload["ok"] is True
+    assert payload["first_status"] == 301
+    assert payload["final_status"] == 200
+    assert payload["redirect_count"] == 1
+    assert payload["expected_statuses"] == [200]
+    assert [hop["status"] for hop in payload["chain"]] == [301, 200]
+    assert payload["chain"][0]["location"] == "/b"
+    assert payload["checked_at"].endswith("+00:00")
+
+
+def test_check_outside_the_context_manager_is_a_programming_error():
+    checker = UrlStatusChecker(StatusCheckOptions())
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(checker.check("https://example.com/"))

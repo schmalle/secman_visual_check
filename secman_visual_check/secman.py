@@ -37,6 +37,24 @@ DEFAULT_ID_PREFIX = "SECMAN-VISUAL"
 DEFAULT_OWNER = "secman-visual-check"
 DEFAULT_MIN_SEVERITY = Severity.MEDIUM
 DEFAULT_TIMEOUT_S = 30.0
+DEFAULT_ASSET_TYPE = "Web Service"
+
+# How a failed status check becomes a vulnerability. States not listed here —
+# "ok" and "redirect" — are healthy and produce nothing.
+STATUS_CATEGORY_BY_STATE = {
+    "unreachable": "unreachable",
+    "server_error": "unexpected_status",
+    "client_error": "unexpected_status",
+    "unexpected_status": "unexpected_status",
+    "redirect_broken": "broken_redirect",
+}
+STATUS_SEVERITY_BY_STATE = {
+    "unreachable": Severity.HIGH,
+    "server_error": Severity.HIGH,
+    "client_error": Severity.MEDIUM,
+    "unexpected_status": Severity.MEDIUM,
+    "redirect_broken": Severity.MEDIUM,
+}
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 CLIENT_NAME = "secman_visual_check"
@@ -145,11 +163,22 @@ class UploadOutcome:
 
 
 @dataclass
+class AssetOutcome:
+    """What happened to one asset registration."""
+
+    hostname: str
+    url: str
+    status: str
+    detail: str = ""
+
+
+@dataclass
 class UploadSummary:
     transport: str
     endpoint: str
     dry_run: bool
     outcomes: list[UploadOutcome] = field(default_factory=list)
+    asset_outcomes: list[AssetOutcome] = field(default_factory=list)
     merged: int = 0
     below_threshold: int = 0
     existing_lookup_error: str | None = None
@@ -161,6 +190,10 @@ class UploadSummary:
     def failures(self) -> list[UploadOutcome]:
         return [o for o in self.outcomes if o.status == "failed"]
 
+    @property
+    def asset_failures(self) -> list[AssetOutcome]:
+        return [o for o in self.asset_outcomes if o.status == "failed"]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "transport": self.transport,
@@ -170,6 +203,15 @@ class UploadSummary:
             "below_threshold": self.below_threshold,
             "existing_lookup_error": self.existing_lookup_error,
             "counts": {status: self.count(status) for status in UPLOAD_STATUSES},
+            "assets": [
+                {
+                    "hostname": o.hostname,
+                    "url": o.url,
+                    "status": o.status,
+                    "detail": o.detail,
+                }
+                for o in self.asset_outcomes
+            ],
             "items": [
                 {
                     "hostname": o.item.hostname,
@@ -238,6 +280,101 @@ def build_items(
     return items, dropped
 
 
+def status_finding_title(status: dict[str, Any]) -> str:
+    """A one-line description of why a status check failed."""
+    state = str(status.get("state") or "unknown")
+    final = status.get("final_status")
+    expected = status.get("expected_statuses") or [200]
+    expected_text = ", ".join(str(code) for code in expected[:5])
+    if state == "unreachable":
+        reason = str(status.get("error") or "no response")
+        return f"Target is unreachable: {reason}"[:200]
+    if state == "redirect_broken":
+        reason = str(status.get("error") or "redirect chain did not resolve")
+        return f"Target has a broken redirect: {reason}"[:200]
+    return f"Target returns HTTP {final} (expected {expected_text})"[:200]
+
+
+def build_status_items(
+    report: dict[str, Any] | ScanReport,
+    *,
+    min_severity: Severity = DEFAULT_MIN_SEVERITY,
+    id_prefix: str = DEFAULT_ID_PREFIX,
+    asset_override: str | None = None,
+    severity_override: Severity | None = None,
+) -> tuple[list[UploadItem], int]:
+    """Turn failed status checks into upload items.
+
+    Healthy targets produce nothing. Reports written before the status check
+    existed simply have no ``status_check`` key and yield ``([], 0)``.
+    Returns ``(items, dropped_below_threshold)``.
+    """
+    data = report.to_dict() if isinstance(report, ScanReport) else report
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise SecmanError("report has no 'results' list; is this a secman_visual_check report?")
+
+    items: list[UploadItem] = []
+    dropped = 0
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        url = str(result.get("url") or "").strip()
+        status = result.get("status_check")
+        if not url or not isinstance(status, dict):
+            continue
+        state = str(status.get("state") or "unknown")
+        category = STATUS_CATEGORY_BY_STATE.get(state)
+        if category is None:
+            continue
+        severity = severity_override or STATUS_SEVERITY_BY_STATE[state]
+        if severity.rank < min_severity.rank:
+            dropped += 1
+            continue
+        items.append(
+            UploadItem(
+                hostname=asset_name(url, asset_override),
+                vulnerability_id=vulnerability_id(url, category, id_prefix),
+                criticality=CRITICALITY_BY_SEVERITY[severity],
+                severity=severity,
+                url=url,
+                category=category,
+                title=status_finding_title(status),
+            )
+        )
+    return items, dropped
+
+
+def collect_assets(
+    report: dict[str, Any] | ScanReport,
+    *,
+    asset_override: str | None = None,
+) -> list[tuple[str, str]]:
+    """``(hostname, representative url)`` for every distinct host in the report.
+
+    One entry per host, in first-seen order, so registering assets writes one row
+    per machine no matter how many of its pages were scanned.
+    """
+    data = report.to_dict() if isinstance(report, ScanReport) else report
+    results = data.get("results")
+    if not isinstance(results, list):
+        raise SecmanError("report has no 'results' list; is this a secman_visual_check report?")
+
+    assets: dict[str, str] = {}
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        url = str(result.get("url") or "").strip()
+        if not url:
+            continue
+        try:
+            host = asset_name(url, asset_override)
+        except SecmanError:
+            continue
+        assets.setdefault(host, url)
+    return list(assets.items())
+
+
 def merge_duplicates(items: Sequence[UploadItem]) -> tuple[list[UploadItem], int]:
     """Collapse items that map to the same SecMan row, keeping the worst severity.
 
@@ -283,6 +420,12 @@ class SecmanUploader:
 
     def upload(self, item: UploadItem, owner: str) -> tuple[str, str]:
         """Write one finding. Returns ``(status, detail)`` with status created/updated."""
+        raise NotImplementedError
+
+    def register_asset(
+        self, hostname: str, owner: str, uri: str, asset_type: str
+    ) -> tuple[str, str]:
+        """Put the host in SecMan's inventory. Returns ``(status, detail)``."""
         raise NotImplementedError
 
     def close(self) -> None:
@@ -471,6 +614,34 @@ class HttpUploader(_HttpxBacked):
         status = "created" if operation == "CREATED" else "updated"
         return status, str(payload.get("message") or "")
 
+    def register_asset(
+        self, hostname: str, owner: str, uri: str, asset_type: str
+    ) -> tuple[str, str]:
+        """``PUT /api/assets/import`` — SecMan's idempotent upsert for scanners.
+
+        It looks the asset up by name and merges, preserving operator-set fields,
+        so re-running a scan never mints a second asset. It needs the ADMIN role;
+        a 401/403 is reported per item rather than aborting the upload.
+        """
+        response = self._send(
+            "PUT",
+            "/api/assets/import",
+            json={"name": hostname, "type": asset_type, "owner": owner, "uri": uri},
+        )
+        if response.status_code >= 400:
+            raise SecmanError(
+                f"HTTP {response.status_code}: {self._detail(response)}"
+            )
+        payload = self._json(response)
+        if not isinstance(payload, dict):
+            raise SecmanError(f"unexpected assets/import response: {str(payload)[:200]}")
+        status = "created" if payload.get("created") else "updated"
+        asset = payload.get("asset")
+        detail = ""
+        if isinstance(asset, dict):
+            detail = f"asset id {asset.get('id')}"
+        return status, detail
+
 
 class McpUploader(_HttpxBacked):
     """JSON-RPC 2.0 client for SecMan's MCP endpoint.
@@ -605,6 +776,23 @@ class McpUploader(_HttpxBacked):
         status = "created" if result.get("vulnerabilityCreated") else "updated"
         return status, str(result.get("message") or "")
 
+    def register_asset(
+        self, hostname: str, owner: str, uri: str, asset_type: str
+    ) -> tuple[str, str]:
+        """MCP's ``create_asset``. Unlike the REST import it is not an upsert, so a
+        rejection naming an existing asset is read as "already registered"."""
+        try:
+            result = self._call_tool(
+                "create_asset",
+                {"name": hostname, "type": asset_type, "owner": owner, "uri": uri},
+            )
+        except SecmanError as exc:
+            message = str(exc).lower()
+            if "already exists" in message or "duplicate" in message:
+                return "skipped", "SecMan already holds this asset"
+            raise
+        return "created", str(result.get("message") or "")
+
 
 def _client_version() -> str:
     from . import __version__
@@ -640,6 +828,12 @@ class SecmanOptions:
     allow_existing: bool = False
     timeout: float = DEFAULT_TIMEOUT_S
     verify_tls: bool = True
+    # status check
+    status_findings: bool = False
+    #: ``None`` means "use STATUS_SEVERITY_BY_STATE".
+    status_severity: Severity | None = None
+    register_assets: bool = False
+    asset_type: str = DEFAULT_ASSET_TYPE
 
     @property
     def has_credentials(self) -> bool:
@@ -704,6 +898,18 @@ def upload_findings(
         id_prefix=options.id_prefix,
         asset_override=options.asset_name,
     )
+    if options.status_findings:
+        # Ordinary UploadItems, so they ride the same dedup, pre-check and
+        # dry-run paths as everything else.
+        status_items, status_below = build_status_items(
+            report,
+            min_severity=options.min_severity,
+            id_prefix=options.id_prefix,
+            asset_override=options.asset_name,
+            severity_override=options.status_severity,
+        )
+        items += status_items
+        below += status_below
     items, merged = merge_duplicates(items)
     items.sort(key=lambda i: (i.hostname, -i.severity.rank, i.vulnerability_id))
 
@@ -734,6 +940,24 @@ def upload_findings(
                     # Losing the pre-check is not fatal: SecMan still upserts on
                     # (asset, cve), so nothing duplicates. Say so and continue.
                     summary.existing_lookup_error = str(exc)
+
+        if options.register_assets:
+            for hostname, url in collect_assets(report, asset_override=options.asset_name):
+                if options.dry_run or uploader is None:
+                    summary.asset_outcomes.append(
+                        AssetOutcome(hostname, url, "planned", "would be registered")
+                    )
+                    continue
+                try:
+                    status, detail = uploader.register_asset(
+                        hostname, options.owner, url, options.asset_type
+                    )
+                except SecmanError as exc:
+                    summary.asset_outcomes.append(
+                        AssetOutcome(hostname, url, "failed", str(exc))
+                    )
+                    continue
+                summary.asset_outcomes.append(AssetOutcome(hostname, url, status, detail))
 
         for item in items:
             if item.key in existing:
@@ -783,6 +1007,13 @@ def write_upload_report(summary: UploadSummary, stream: TextIO | None = None) ->
     print(f"SecMan {mode} — {summary.transport} — {summary.endpoint}", file=out)
     print("=" * 72, file=out)
 
+    for asset in summary.asset_outcomes:
+        print(f"  [{asset.status}] asset {asset.hostname}  {asset.url}", file=out)
+        if asset.detail:
+            print(f"      {asset.detail}", file=out)
+    if summary.asset_outcomes:
+        print("", file=out)
+
     if not summary.outcomes:
         print("No findings to upload.", file=out)
     for outcome in summary.outcomes:
@@ -802,6 +1033,12 @@ def write_upload_report(summary: UploadSummary, stream: TextIO | None = None) ->
         f"{summary.count(s)} {s}" for s in UPLOAD_STATUSES if summary.count(s) or s != "planned"
     )
     print(f"SecMan: {counts}", file=out)
+    if summary.asset_outcomes:
+        by_status: dict[str, int] = {}
+        for outcome in summary.asset_outcomes:
+            by_status[outcome.status] = by_status.get(outcome.status, 0) + 1
+        breakdown = ", ".join(f"{count} {status}" for status, count in sorted(by_status.items()))
+        print(f"  assets: {breakdown}", file=out)
     if summary.merged:
         print(
             f"  {summary.merged} duplicate finding(s) merged into existing rows before upload",

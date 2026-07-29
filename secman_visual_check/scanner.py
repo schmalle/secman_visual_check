@@ -11,6 +11,7 @@ from .capture import BrowserCapturer
 from .config import ScanConfig
 from .models import ScanReport, ScanResult, utcnow
 from .robots import RobotsCache
+from .status import UrlStatusChecker
 
 ProgressHook = Callable[[ScanResult, int, int], None]
 
@@ -47,6 +48,9 @@ async def run_scan(
         capturer = await stack.enter_async_context(
             BrowserCapturer(config.capture, config.screenshot_dir)
         )
+        checker: UrlStatusChecker | None = None
+        if config.status_check.enabled:
+            checker = await stack.enter_async_context(UrlStatusChecker(config.status_check))
         analyzer: VisionAnalyzer | None = None
         if config.analyzer is not None:
             analyzer = await stack.enter_async_context(
@@ -60,6 +64,12 @@ async def run_scan(
                 if robots is not None and not await robots.allowed(url):
                     result.skipped_reason = "disallowed by robots.txt"
                 else:
+                    # Ahead of the capture and outside capture_sem: it is one cheap
+                    # request that should not hold a browser slot, and running it
+                    # first means the status is known even if Chromium then dies on
+                    # the page. The checker bounds its own fan-out.
+                    if checker is not None:
+                        result.status_check = await checker.check(url)
                     async with capture_sem:
                         result.capture = await capturer.capture(url)
                     if analyzer is not None and result.capture.worth_analyzing:
