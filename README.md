@@ -16,6 +16,11 @@ into [SecMan](https://github.com/schmalle/secman) — see
 [Uploading findings to SecMan](#uploading-findings-to-secman) — and status
 results can be mirrored into MariaDB, see [db/README.md](db/README.md).
 
+Every credential can be handed over as a Proton Pass reference rather than the
+secret itself (see [Credentials from Proton Pass](#credentials-from-proton-pass)),
+and `--dry-run` resolves the whole configuration and prints what a run *would*
+do without touching anything (see [Dry runs](#dry-runs)).
+
 > **Scan only systems you own or are explicitly authorised to test.** The tool
 > loads pages and sends screenshots to a third-party model provider; both are
 > actions you need permission for.
@@ -460,6 +465,7 @@ with `--structured-output {json_schema,json_object,none}`.
 | `SECMAN_MODEL` | Default model slug |
 | `SECMAN_BASE_URL` | Default API base URL |
 | `SECMAN_BROWSER_EXECUTABLE` | Path to an existing Chromium binary |
+| `SECMAN_PASS_CLI` | Proton Pass CLI binary, if it is not on `PATH` (`--pass-cli-binary` wins) |
 
 ## Scanning pages behind a login
 
@@ -487,8 +493,123 @@ configuration error.
 python -m secman_visual_check -f targets.txt --fail-on critical --quiet
 ```
 
-Use `--fail-on none` to always exit `0`, and `--dry-run` to print the resolved,
-de-duplicated target list without touching the network.
+Use `--fail-on none` to always exit `0`, and `--dry-run -q` to print the
+resolved, de-duplicated target list without touching the network.
+
+## Dry runs
+
+`--dry-run` resolves exactly the configuration a real run would use — including
+fetching every credential — and then prints the plan instead of executing it.
+
+```bash
+python -m secman_visual_check -f targets.txt --dry-run \
+  --secman-upload --db-store --mail --mail-to ops@example.com
+```
+
+```
+========================================================================
+Dry run — nothing will be written, sent or uploaded
+========================================================================
+
+Targets (2):
+  https://example.com/
+  https://example.org/admin
+
+Stages:
+  status check   HEAD, falling back to GET, expect 200, 8 worker(s), checksums on, 10 redirect hop(s)
+  browser        1440x900, full page (max 4000px), 4 worker(s), 30s timeout
+  analysis       anthropic/claude-sonnet-4.5 via https://openrouter.ai/api/v1, 3 worker(s), API key set
+
+Would write:
+  screenshots    scan-output/screenshots
+  json           scan-output/report.json
+  html           scan-output/report.html
+  csv            scan-output/report.csv
+  statistics     scan-output/statistics.txt
+
+Integrations:
+  database       would write status rows to svc@db.internal:3306/secman_visual_check
+  email          would send via smtp://smtp.example.com:587 to ops@example.com (only when something is wrong)
+  secman         would upload findings at medium or above to https://secman.internal over http
+
+Nothing was written. Re-run without --dry-run to execute this plan.
+```
+
+A dry run writes nothing — no report, no screenshot, no database row, no email,
+no SecMan vulnerability — and never launches Chromium or calls the model. It
+still *validates* everything a real run validates, and says in the plan where a
+relaxed check would have stopped a real run (`NO API KEY`, `NO SMTP HOST`,
+`NO CREDENTIALS`).
+
+It applies to the standalone commands too:
+
+```bash
+# Exactly what would be filed in SecMan, from an earlier report
+python -m secman_visual_check --dry-run --secman-upload-report scan-output/report.json
+
+# What a flag change would do — offline, no database needed
+python -m secman_visual_check --dry-run --db-set-flag 'https://example.com/=OK' --db-user svc
+
+# Just the resolved target list, one per line
+python -m secman_visual_check -f targets.txt --dry-run -q
+```
+
+`--dry-run` implies `--secman-dry-run` and `--mail-dry-run`; those two are
+narrower and suppress one integration's writes while the scan itself runs for
+real. Full reference: [docs/DRY_RUN.md](docs/DRY_RUN.md).
+
+## Credentials from Proton Pass
+
+Any credential — API keys, tokens, database and SMTP passwords — can be written
+as a reference to an item in a Proton Pass vault instead of the secret itself.
+The value is fetched through [`pass-cli`](https://protonpass.github.io/pass-cli/)
+before the scan starts:
+
+```
+pass://<vault>/<item>/<field>       # field is optional and defaults to "password"
+```
+
+```bash
+pass-cli login
+
+python -m secman_visual_check -f targets.txt \
+  --api-key 'pass://Infra/OpenRouter/api-key' \
+  --secman-upload \
+  --secman-token 'pass://Infra/SecMan automation/token'
+```
+
+Environment variables carry references too, so an exported default works the
+same way:
+
+```bash
+export SECMAN_DB_URL='pass://Infra/Scanner DB/dsn'
+python -m secman_visual_check --db-store -f targets.txt
+```
+
+This is entirely opt-in: a value that is not a reference is used verbatim, and
+`pass-cli` is only ever invoked if you actually write one. It is not a
+dependency of the package.
+
+The secret never reaches a command line — only the reference is passed to
+`pass-cli` — and never reaches a report: text coming back from a backend is
+scrubbed of resolved values before it is printed. A reference that cannot be
+resolved is a hard error *before* the scan, like every other credential check.
+
+`--pass-cli-binary PATH` (or `$SECMAN_PASS_CLI`) points at a `pass-cli` that is
+not on `PATH`; `--pass-cli-timeout` bounds one call; `--no-pass-cli` refuses
+references outright for hosts where shelling out to a password manager is not
+wanted.
+
+The shell scripts do the same. `db/install.sh` resolves `DB_PASSWORD` and
+`DB_ROOT_PASSWORD`, so the database can be created without the password ever
+being typed:
+
+```bash
+DB_PASSWORD='pass://Infra/Scanner DB/password' db/install.sh
+```
+
+Full reference, including where references are accepted and what each error
+means: [docs/PASS_CLI.md](docs/PASS_CLI.md).
 
 ## Uploading findings to SecMan
 
@@ -578,6 +699,8 @@ troubleshooting: [docs/SECMAN_UPLOAD.md](docs/SECMAN_UPLOAD.md).
 | `--db-store`, `--db-url`, `--db-*` | Mirror the status results into MariaDB. See [db/README.md](db/README.md). |
 | `--db-set-flag URL=FLAG` | Flag a URL as `OK`, `NEW` or `NOT_CHECKED` and exit. |
 | `--mail`, `--mail-transport`, `--mail-to`, `--mail-*` | Email the results over SMTP, Microsoft 365 or AWS SES. |
+| `--dry-run` | Resolve everything, print the plan, execute nothing. `-q` narrows it to the target list. See [docs/DRY_RUN.md](docs/DRY_RUN.md). |
+| `--pass-cli-binary`, `--pass-cli-timeout`, `--no-pass-cli` | Where to find the Proton Pass CLI that resolves `pass://` credentials, how long to wait for it, or refuse references outright. See [docs/PASS_CLI.md](docs/PASS_CLI.md). |
 | `-v/--verbose` | Print evidence and remediation for every finding. |
 
 Full list: `python -m secman_visual_check --help`.
@@ -659,6 +782,8 @@ target was skipped by `robots.txt`.
 | `secman.py` | Maps findings onto SecMan vulnerabilities; HTTP and MCP upload |
 | `db.py` | Optional MariaDB mirror: status history, URL flags, change tracking |
 | `mailer.py` | Result email over SMTP, Microsoft 365 or AWS SES |
+| `secrets.py` | Resolves `pass://` credentials through the Proton Pass CLI |
+| `plan.py` | `--dry-run`: what a run would do, rendered from the same options |
 | `cli.py` | Argument parsing and exit codes |
 
 ## Caveats
@@ -682,5 +807,8 @@ The suite covers URL handling, prompt construction, the model-response parser,
 the analyzer's HTTP behaviour (retries, schema downgrade, auth failures) against
 a mocked transport, scanner orchestration, report rendering, and the SecMan
 upload — ID stability, the three de-duplication layers, dry-run behaviour, and
-both transports against a mocked backend. It does not require a browser, an API
-key or a SecMan instance.
+both transports against a mocked backend. `pass://` resolution is covered on
+both sides — the Python resolver against a fake `pass-cli`, and
+`scripts/passcli.sh` through bash against a stub binary — and `--dry-run` is
+checked to validate everything while writing nothing. It does not require a
+browser, an API key, a Proton Pass account or a SecMan instance.

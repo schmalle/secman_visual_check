@@ -141,8 +141,22 @@ point it at your SecMan instance.
 
 Passwords, client secrets and AWS keys can be passed as flags, but the
 environment variables above are the better route: flags show up in process
-listings and shell history. Nothing secret is ever printed — the console line
-names the transport and endpoint only:
+listings and shell history.
+
+Better still, `--mail-smtp-password` and `--mail-client-secret` accept a
+`pass://vault/item/field` reference instead of the secret, fetched through the
+Proton Pass CLI before the scan starts — see [PASS_CLI.md](PASS_CLI.md):
+
+```bash
+secman-visual-check --mail --mail-transport smtp \
+  --mail-smtp-host smtp.example.com --mail-smtp-user scanner \
+  --mail-smtp-password 'pass://Infra/Scanner SMTP/password' \
+  --mail-from scanner@example.com --mail-to ops@example.com \
+  -f targets.txt
+```
+
+Nothing secret is ever printed — the console line names the transport and
+endpoint only:
 
 ```
 Email: sent via o365 (graph:contoso-tenant-id) to ops@contoso.com

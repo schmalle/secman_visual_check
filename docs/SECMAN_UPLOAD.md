@@ -131,11 +131,16 @@ writing anything into your inventory.
 
 Credentials are optional for a dry run and required otherwise. Validation happens
 **before the scan starts**, so a credential typo fails in a second rather than
-after a ten-minute crawl.
+after a ten-minute crawl. Any of them may be a `pass://vault/item/field`
+reference resolved through the Proton Pass CLI — see
+[PASS_CLI.md](PASS_CLI.md).
 
-Note that `--dry-run` (the tool's existing flag) is a different thing: it prints
-the resolved target list and exits without scanning. `--secman-dry-run` scans
-normally and only suppresses the upload.
+Note that `--dry-run` is the wider flag: it plans the *whole* run — targets,
+stages, report files, database, email and this upload — and executes none of it.
+`--secman-dry-run` scans normally and only suppresses the upload. `--dry-run`
+implies `--secman-dry-run`, so `--dry-run --secman-upload-report report.json`
+prints exactly this payload list without writing. See
+[DRY_RUN.md](DRY_RUN.md).
 
 ## Transports
 

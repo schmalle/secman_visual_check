@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import os
 import sys
 from pathlib import Path
+from typing import Sequence
 
 from . import __version__
 from .analyzer import DEFAULT_BASE_URL, DEFAULT_MODEL, AnalyzerError, AnalyzerOptions
@@ -36,6 +38,7 @@ from .db import (
     write_db_report,
     write_flag_report,
 )
+from .plan import ScanPlan, write_plan
 from .scanner import run_scan
 from .secman import (
     DEFAULT_ASSET_TYPE,
@@ -49,6 +52,11 @@ from .secman import (
     upload_findings,
     write_upload_report,
 )
+from .secrets import BINARY_ENV as PASS_CLI_ENV
+from .secrets import DEFAULT_BINARY as DEFAULT_PASS_CLI
+from .secrets import DEFAULT_TIMEOUT_S as PASS_CLI_TIMEOUT_S
+from .secrets import SCHEME as SECRET_SCHEME
+from .secrets import SecretError, SecretResolver, redact
 from .status import DEFAULT_CHECKSUM_MAX_BYTES
 from .status import DEFAULT_CONCURRENCY as DEFAULT_STATUS_CONCURRENCY
 from .status import DEFAULT_MAX_REDIRECTS
@@ -344,7 +352,44 @@ def build_parser() -> argparse.ArgumentParser:
         default="high",
         help="exit 1 when a finding at this severity or above exists (default: %(default)s)",
     )
-    run.add_argument("--dry-run", action="store_true", help="print the resolved targets and exit")
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="resolve everything — targets, credentials, every stage — then print "
+        "the plan and exit without writing, sending or uploading anything. Add "
+        "-q to print only the resolved target URLs",
+    )
+
+    secrets = parser.add_argument_group(
+        "secrets",
+        "Any credential this tool accepts — API keys, tokens, database and SMTP "
+        "passwords — "
+        f"may be given as a {SECRET_SCHEME}vault/item/field reference instead of "
+        "the secret itself; the value is fetched from Proton Pass through "
+        "pass-cli before the scan starts. Values that are not references are "
+        "used verbatim, so nothing changes unless you opt in.",
+    )
+    secrets.add_argument(
+        "--pass-cli-binary",
+        default=None,
+        metavar="PATH",
+        help=f"Proton Pass CLI to invoke (default: ${PASS_CLI_ENV} or {DEFAULT_PASS_CLI})",
+    )
+    secrets.add_argument(
+        "--pass-cli-timeout",
+        type=float,
+        default=PASS_CLI_TIMEOUT_S,
+        metavar="SECONDS",
+        help="how long to wait for one pass-cli call (default: %(default)s)",
+    )
+    secrets.add_argument(
+        "--no-pass-cli",
+        dest="pass_cli",
+        action="store_false",
+        default=True,
+        help=f"refuse {SECRET_SCHEME} references instead of resolving them, for "
+        "hosts where shelling out to a password manager is not wanted",
+    )
 
     secman = parser.add_argument_group(
         "secman upload",
@@ -722,10 +767,34 @@ def parse_basic_auth(value: str | None) -> tuple[str, str] | None:
     return user, password
 
 
-def build_config(args: argparse.Namespace) -> ScanConfig:
-    """Turn parsed arguments into a ScanConfig, raising ValueError on bad input."""
+def build_secret_resolver(args: argparse.Namespace) -> SecretResolver:
+    """The one resolver a run uses, so a reference is fetched once, not per flag."""
+    return SecretResolver(
+        binary=(
+            args.pass_cli_binary or os.environ.get(PASS_CLI_ENV) or DEFAULT_PASS_CLI
+        ),
+        timeout=max(0.1, args.pass_cli_timeout),
+        enabled=args.pass_cli,
+    )
+
+
+def build_config(
+    args: argparse.Namespace, resolver: SecretResolver | None = None
+) -> ScanConfig:
+    """Turn parsed arguments into a ScanConfig, raising ValueError on bad input.
+
+    Raises :class:`SecretError` when a credential is a ``pass://`` reference that
+    cannot be resolved — before the browser is launched, like every other
+    credential check.
+    """
+    resolver = resolver or SecretResolver()
     width, height = parse_viewport(args.viewport)
     output_dir = Path(args.output_dir)
+
+    headers = {
+        name: resolver.resolve(value, what=f"--header {name!r}") or ""
+        for name, value in parse_headers(args.header).items()
+    }
 
     capture = CaptureOptions(
         viewport_width=width,
@@ -737,8 +806,10 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
         settle_ms=int(args.settle * 1000),
         user_agent=args.user_agent,
         ignore_https_errors=args.insecure,
-        extra_headers=parse_headers(args.header),
-        basic_auth=parse_basic_auth(args.basic_auth),
+        extra_headers=headers,
+        basic_auth=parse_basic_auth(
+            resolver.resolve_pair(args.basic_auth, what="--basic-auth")
+        ),
         storage_state=args.storage_state,
         browser_channel=args.browser_channel,
         executable_path=args.browser_executable,
@@ -755,9 +826,12 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
             extra = Path(args.instructions_file).read_text(encoding="utf-8")
             instructions = f"{instructions}\n{extra}".strip()
         api_key = (
-            args.api_key
-            or os.environ.get("OPENROUTER_API_KEY")
-            or os.environ.get("SECMAN_API_KEY")
+            resolver.resolve(
+                args.api_key
+                or os.environ.get("OPENROUTER_API_KEY")
+                or os.environ.get("SECMAN_API_KEY"),
+                what="--api-key",
+            )
             or ""
         )
         analyzer = AnalyzerOptions(
@@ -816,17 +890,28 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
     )
 
 
-def build_secman_options(args: argparse.Namespace) -> SecmanOptions:
+def build_secman_options(
+    args: argparse.Namespace, resolver: SecretResolver | None = None
+) -> SecmanOptions:
     """Resolve the SecMan flags against the environment, raising ValueError if unusable."""
+    resolver = resolver or SecretResolver()
     options = SecmanOptions(
         transport=args.secman_transport,
         base_url=(args.secman_url or os.environ.get("SECMAN_URL") or DEFAULT_BACKEND_URL),
         dry_run=args.secman_dry_run,
-        token=args.secman_token or os.environ.get("SECMAN_TOKEN"),
+        token=resolver.resolve(
+            args.secman_token or os.environ.get("SECMAN_TOKEN"), what="--secman-token"
+        ),
         username=args.secman_username or os.environ.get("SECMAN_USERNAME"),
-        password=args.secman_password or os.environ.get("SECMAN_PASSWORD"),
+        password=resolver.resolve(
+            args.secman_password or os.environ.get("SECMAN_PASSWORD"),
+            what="--secman-password",
+        ),
         # Deliberately not SECMAN_API_KEY: that one is the vision model's key.
-        api_key=args.secman_api_key or os.environ.get("SECMAN_MCP_API_KEY"),
+        api_key=resolver.resolve(
+            args.secman_api_key or os.environ.get("SECMAN_MCP_API_KEY"),
+            what="--secman-api-key",
+        ),
         user_email=args.secman_user_email or os.environ.get("SECMAN_MCP_USER_EMAIL"),
         min_severity=Severity(args.secman_min_severity),
         owner=args.secman_owner,
@@ -848,10 +933,17 @@ def build_secman_options(args: argparse.Namespace) -> SecmanOptions:
     return options
 
 
-def build_db_options(args: argparse.Namespace) -> DbOptions:
+def build_db_options(
+    args: argparse.Namespace, resolver: SecretResolver | None = None
+) -> DbOptions:
     """Resolve the database flags against the environment, raising ValueError if unusable."""
+    resolver = resolver or SecretResolver()
     enabled = args.db_store or _env_flag("SECMAN_DB_STORE")
-    url = args.db_url or os.environ.get("SECMAN_DB_URL")
+    # The whole DSN can be one reference: the password inside it would otherwise
+    # be the single worst thing to have on a command line.
+    url = resolver.resolve(
+        args.db_url or os.environ.get("SECMAN_DB_URL"), what="--db-url"
+    )
     overrides = {
         "enabled": enabled,
         "table_prefix": args.db_table_prefix,
@@ -864,7 +956,11 @@ def build_db_options(args: argparse.Namespace) -> DbOptions:
             host=args.db_host or os.environ.get("SECMAN_DB_HOST") or "127.0.0.1",
             port=args.db_port or int(os.environ.get("SECMAN_DB_PORT") or 3306),
             user=args.db_user or os.environ.get("SECMAN_DB_USER") or "",
-            password=args.db_password or os.environ.get("SECMAN_DB_PASSWORD") or "",
+            password=resolver.resolve(
+                args.db_password or os.environ.get("SECMAN_DB_PASSWORD"),
+                what="--db-password",
+            )
+            or "",
             database=args.db_name or os.environ.get("SECMAN_DB_NAME") or DEFAULT_DB_NAME,
             **overrides,
         )
@@ -872,8 +968,11 @@ def build_db_options(args: argparse.Namespace) -> DbOptions:
     return options
 
 
-def build_mail_options(args: argparse.Namespace) -> MailOptions:
+def build_mail_options(
+    args: argparse.Namespace, resolver: SecretResolver | None = None
+) -> MailOptions:
     """Resolve the email flags against the environment, raising ValueError if unusable."""
+    resolver = resolver or SecretResolver()
     recipients = list(args.mail_to)
     if not recipients:
         recipients = [
@@ -898,14 +997,22 @@ def build_mail_options(args: argparse.Namespace) -> MailOptions:
         or int(os.environ.get("SECMAN_MAIL_SMTP_PORT") or 587),
         smtp_user=args.mail_smtp_user or os.environ.get("SECMAN_MAIL_SMTP_USER") or "",
         smtp_password=(
-            args.mail_smtp_password or os.environ.get("SECMAN_MAIL_SMTP_PASSWORD") or ""
+            resolver.resolve(
+                args.mail_smtp_password or os.environ.get("SECMAN_MAIL_SMTP_PASSWORD"),
+                what="--mail-smtp-password",
+            )
+            or ""
         ),
         smtp_tls=args.mail_smtp_tls,
         smtp_ssl=args.mail_smtp_ssl,
         tenant_id=args.mail_tenant_id or os.environ.get("SECMAN_MAIL_TENANT_ID") or "",
         client_id=args.mail_client_id or os.environ.get("SECMAN_MAIL_CLIENT_ID") or "",
         client_secret=(
-            args.mail_client_secret or os.environ.get("SECMAN_MAIL_CLIENT_SECRET") or ""
+            resolver.resolve(
+                args.mail_client_secret or os.environ.get("SECMAN_MAIL_CLIENT_SECRET"),
+                what="--mail-client-secret",
+            )
+            or ""
         ),
         aws_region=(
             args.mail_aws_region
@@ -923,14 +1030,29 @@ def _env_flag(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _run_secman_upload(report, options: SecmanOptions, fail_on_error: bool) -> int:
+def _emit(writer, *args, secrets: Sequence[str] = (), **kwargs) -> None:
+    """Run a report writer, then scrub resolved secrets out of what it printed.
+
+    Every one of these writers echoes text from somewhere else — a SecMan error
+    body, a database driver's message. A backend that rejects a credential by
+    quoting it back must not get it into the console output or a CI log, so the
+    output goes through a buffer on its way to stdout rather than straight to it.
+    """
+    buffer = io.StringIO()
+    writer(*args, stream=buffer, **kwargs)
+    sys.stdout.write(redact(buffer.getvalue(), secrets))
+
+
+def _run_secman_upload(
+    report, options: SecmanOptions, fail_on_error: bool, secrets: Sequence[str] = ()
+) -> int:
     """Upload a report's findings and turn the result into an exit code."""
     try:
         summary = upload_findings(report, options)
     except SecmanError as exc:
-        print(f"error: SecMan upload failed: {exc}", file=sys.stderr)
+        print(f"error: SecMan upload failed: {redact(str(exc), secrets)}", file=sys.stderr)
         return EXIT_ERROR
-    write_upload_report(summary)
+    _emit(write_upload_report, summary, secrets=secrets)
     if (summary.failures or summary.asset_failures) and fail_on_error:
         return EXIT_ERROR
     return EXIT_OK
@@ -954,27 +1076,44 @@ def _progress_hook(quiet: bool):
     return hook
 
 
+def _report_outputs(args: argparse.Namespace, config: ScanConfig) -> list[tuple[str, Path]]:
+    """The files a run would write, in the order it would write them."""
+    outputs: list[tuple[str, Path]] = []
+    if config.visual_check:
+        outputs.append(("screenshots", config.screenshot_dir))
+    for name, flag, override, filename in (
+        ("json", args.no_json, args.json, "report.json"),
+        ("html", args.no_html, args.html, "report.html"),
+        ("csv", args.no_csv, args.csv, "report.csv"),
+        ("statistics", args.no_stats, args.stats, "statistics.txt"),
+    ):
+        if not flag:
+            outputs.append((name, Path(override) if override else config.output_dir / filename))
+    return outputs
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    upload_requested = args.secman_upload or args.secman_upload_report
-    if upload_requested:
-        try:
-            secman_options = build_secman_options(args)
-        except ValueError as exc:
-            # Fail before the scan: a ten-minute crawl should not end on a typo
-            # in the credentials.
-            print(f"error: {exc}", file=sys.stderr)
-            return EXIT_ERROR
-    else:
-        secman_options = None
+    # One switch, applied before anything is built: a dry run must not be able
+    # to write through a stage that was never told about it.
+    if args.dry_run:
+        args.secman_dry_run = True
+        args.mail_dry_run = True
 
+    resolver = build_secret_resolver(args)
+
+    upload_requested = args.secman_upload or args.secman_upload_report
     try:
-        # Same rule as the SecMan credentials: fail before the scan, not after it.
-        db_options = build_db_options(args)
-        mail_options = build_mail_options(args)
-    except ValueError as exc:
+        # Fail before the scan: a ten-minute crawl should not end on a typo in
+        # the credentials, nor on a pass:// reference that names nothing.
+        secman_options = (
+            build_secman_options(args, resolver) if upload_requested else None
+        )
+        db_options = build_db_options(args, resolver)
+        mail_options = build_mail_options(args, resolver)
+    except (ValueError, SecretError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
 
@@ -990,6 +1129,25 @@ def main(argv: list[str] | None = None) -> int:
         db_options.enabled = True
         try:
             db_options.validate()
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        if args.dry_run:
+            # Deliberately offline. Reading the current flags would make a nicer
+            # preview, but it would also mean a dry run of a two-line command
+            # needs a reachable database and an installed driver.
+            write_plan(
+                ScanPlan(
+                    action=f"set URL flags in {db_options.dsn}",
+                    secrets=resolver.resolved,
+                    notes=[
+                        "Would set:\n"
+                        + "\n".join(f"  {flag:<12} {url}" for url, flag in assignments)
+                    ],
+                )
+            )
+            return EXIT_OK
+        try:
             changes = set_flags(assignments, db_options)
         except (ValueError, DatabaseError) as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1005,7 +1163,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return EXIT_ERROR
         assert secman_options is not None
-        return _run_secman_upload(stored, secman_options, args.secman_fail_on_error)
+        return _run_secman_upload(
+            stored, secman_options, args.secman_fail_on_error, resolver.values
+        )
 
     if not args.urls and not args.file and not args.stdin:
         parser.error("no targets given; pass URLs, --file PATH or --stdin")
@@ -1020,16 +1180,31 @@ def main(argv: list[str] | None = None) -> int:
         print("error: no valid targets after parsing input", file=sys.stderr)
         return EXIT_ERROR
 
-    if args.dry_run:
-        for url in targets:
-            print(url)
-        return EXIT_OK
-
     try:
-        config = build_config(args)
-    except (argparse.ArgumentTypeError, ValueError, OSError) as exc:
+        config = build_config(args, resolver)
+    except (argparse.ArgumentTypeError, ValueError, OSError, SecretError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_ERROR
+
+    if args.dry_run:
+        if args.quiet:
+            # The original --dry-run output, kept verbatim so scripts that pipe
+            # the target list into something else keep working.
+            for url in targets:
+                print(url)
+            return EXIT_OK
+        write_plan(
+            ScanPlan(
+                targets=targets,
+                config=config,
+                outputs=_report_outputs(args, config),
+                db=db_options,
+                mail=mail_options,
+                secman=secman_options,
+                secrets=resolver.resolved,
+            )
+        )
+        return EXIT_OK
 
     if not args.quiet:
         if not config.visual_check:
@@ -1090,7 +1265,7 @@ def main(argv: list[str] | None = None) -> int:
     flag_changes: list = []
     if db_options.enabled:
         summary = store_report(report, db_options)
-        write_db_report(summary)
+        _emit(write_db_report, summary, secrets=resolver.values)
         flag_changes = summary.flag_changes
         if summary.error and db_options.fail_on_error:
             db_status = EXIT_ERROR
@@ -1104,12 +1279,12 @@ def main(argv: list[str] | None = None) -> int:
             flag_changes=flag_changes,
             dashboard_url=args.mail_dashboard_url,
         )
-        write_mail_report(mail_summary)
+        _emit(write_mail_report, mail_summary, secrets=resolver.values)
 
     upload_status = EXIT_OK
     if secman_options is not None:
         upload_status = _run_secman_upload(
-            report, secman_options, args.secman_fail_on_error
+            report, secman_options, args.secman_fail_on_error, resolver.values
         )
 
     if config.fail_on is not None and report.max_severity.rank >= config.fail_on.rank:

@@ -53,6 +53,17 @@ Credentials are resolved and validated *before* the scan starts, so a typo costs
 a second rather than a ten-minute crawl. By default a failed write is reported
 and the exit code is unaffected; `--db-fail-on-error` makes it exit non-zero.
 
+`--db-password` and `--db-url` accept a `pass://vault/item/field` reference
+instead of the secret, resolved through the Proton Pass CLI — the DSN in
+particular is worth keeping off a command line, since it carries the password
+inside it. `db/install.sh` resolves `DB_PASSWORD` and `DB_ROOT_PASSWORD` the
+same way. See [../docs/PASS_CLI.md](../docs/PASS_CLI.md).
+
+```bash
+export SECMAN_DB_URL='pass://Infra/Scanner DB/dsn'
+DB_PASSWORD='pass://Infra/Scanner DB/password' db/install.sh
+```
+
 ## URL flags and change tracking
 
 Beyond the per-run log, the database carries a **current state** for every URL:

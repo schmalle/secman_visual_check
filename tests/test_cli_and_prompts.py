@@ -275,8 +275,10 @@ def test_db_credentials_are_validated_before_the_scan(capsys):
     assert "--db-user" in capsys.readouterr().err
 
 
-def test_dry_run_prints_targets_and_exits_ok(capsys):
-    code = main(["example.com", "https://example.org/x", "--dry-run"])
+def test_quiet_dry_run_prints_only_the_targets(capsys):
+    # The original --dry-run output. Scripts pipe it into other tools, so -q
+    # keeps it free of the plan's headings.
+    code = main(["example.com", "https://example.org/x", "--dry-run", "-q"])
     assert code == 0
     out = capsys.readouterr().out.split()
     assert out == ["https://example.com/", "https://example.org/x"]
