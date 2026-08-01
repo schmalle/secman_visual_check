@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import os
 import re
@@ -12,8 +13,53 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .models import PageCapture
+from .ssrf_guard import is_unsafe_redirect, same_host
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _make_secure_route_handler(
+    original_url: str,
+    extra_headers: dict[str, str] | None,
+    basic_auth: tuple[str, str] | None,
+    block_private_redirects: bool,
+):
+    """Build a Playwright route handler that:
+
+    1. Aborts document navigations (main frame or iframe — a redirect or an
+       embedded frame) that land on a private/internal address on a
+       different host than ``original_url`` (SSRF guard, see ssrf_guard.py).
+    2. Attaches ``extra_headers``/``basic_auth`` only to requests that stay
+       on ``original_url``'s host — never to a redirect target, an embedded
+       cross-origin iframe, or a third-party subresource (ads, trackers,
+       CDNs), which would otherwise silently receive credentials meant for
+       one origin.
+    """
+
+    async def handler(route):
+        request = route.request
+        if (
+            block_private_redirects
+            and request.resource_type == "document"
+            and await is_unsafe_redirect(original_url, request.url)
+        ):
+            await route.abort()
+            return
+
+        if (extra_headers or basic_auth) and same_host(original_url, request.url):
+            headers = dict(await request.all_headers())
+            if extra_headers:
+                headers.update(extra_headers)
+            if basic_auth:
+                username, password = basic_auth
+                token = base64.b64encode(f"{username}:{password}".encode()).decode()
+                headers["authorization"] = f"Basic {token}"
+            await route.continue_(headers=headers)
+            return
+
+        await route.continue_()
+
+    return handler
 
 
 @dataclass
@@ -34,6 +80,11 @@ class CaptureOptions:
     device_scale_factor: float = 1.0
     browser_channel: str | None = None
     executable_path: str | None = None
+    #: A compromised or malicious target can redirect (or embed an iframe
+    #: pointing) at 169.254.169.254, 127.0.0.1, or other internal addresses;
+    #: on by default, blocks navigation to such a host unless it matches the
+    #: host originally requested. See ssrf_guard.py.
+    block_private_redirects: bool = True
 
 
 def screenshot_filename(url: str, index: int) -> str:
@@ -115,14 +166,14 @@ class BrowserCapturer:
         }
         if self.options.user_agent:
             context_kwargs["user_agent"] = self.options.user_agent
-        if self.options.extra_headers:
-            context_kwargs["extra_http_headers"] = dict(self.options.extra_headers)
-        if self.options.basic_auth:
-            username, password = self.options.basic_auth
-            context_kwargs["http_credentials"] = {
-                "username": username,
-                "password": password,
-            }
+        # extra_headers/basic_auth are deliberately NOT set here: a
+        # context-level default (extra_http_headers / http_credentials) is
+        # attached to every request the shared browser context makes,
+        # including cross-origin redirects, embedded iframes, and
+        # third-party subresources (ads, trackers, CDNs) — not just the
+        # target page. They are instead injected per-request by the route
+        # handler installed in `capture()`, only for requests that stay on
+        # the host the operator targeted for that specific capture.
         if self.options.storage_state:
             context_kwargs["storage_state"] = self.options.storage_state
 
@@ -170,6 +221,17 @@ class BrowserCapturer:
             else None,
         )
         page.on("pageerror", lambda err: console_errors.append(f"pageerror: {err}"[:300]))
+
+        if self.options.block_private_redirects or self.options.extra_headers or self.options.basic_auth:
+            await page.route(
+                "**/*",
+                _make_secure_route_handler(
+                    url,
+                    self.options.extra_headers if self.options.extra_headers else None,
+                    self.options.basic_auth,
+                    self.options.block_private_redirects,
+                ),
+            )
 
         try:
             try:

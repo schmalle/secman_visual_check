@@ -39,11 +39,22 @@ service worker, a cache, or a client-side redirect is in play.
    against the current URL and repeat. A `303` turns the rest of the walk into a
    `GET`, per RFC 9110.
 4. Stop on: a non-redirect status, a missing `Location`, the hop cap
-   (`--status-max-redirects`, default 10), a URL already visited (a loop), or a
-   `Location` that is not `http(s)`.
+   (`--status-max-redirects`, default 10), a URL already visited (a loop), a
+   `Location` that is not `http(s)`, or — on by default — a `Location` that
+   resolves to a private/loopback/link-local address on a **different host**
+   than the target (`--allow-private-redirects` opts back in; see below).
 
 Transport failures — DNS, TLS, connection refused, timeout — are recorded, never
 raised. A dead host is a result, not a crash.
+
+A target's `Location` is followed wherever it points, but `--basic-auth` and
+`-H`/`--header` credentials are only ever attached to a request that stays on
+the target's own host — never to a redirect hop that lands elsewhere, and
+never to the body fetch a checksum performs against the final URL. A
+compromised or malicious target should not be able to redirect the scanner at
+internal infrastructure or cloud metadata endpoints (e.g. `169.254.169.254`)
+and collect whatever credentials were configured for a completely different
+site.
 
 ## States
 
@@ -51,7 +62,7 @@ raised. A dead host is a result, not a crash.
 | --- | --- | --- |
 | `ok` | final status is expected, no redirects | ✔ |
 | `redirect` | final status is expected, reached via ≥1 redirect | ✔ |
-| `redirect_broken` | loop, hop cap reached, missing or unusable `Location` | ✘ |
+| `redirect_broken` | loop, hop cap reached, missing/unusable `Location`, or a redirect blocked as a likely SSRF target | ✘ |
 | `unexpected_status` | a 1xx/2xx that was not expected, e.g. 204 where 200 was asked for | ✘ |
 | `client_error` | final status is 4xx | ✘ |
 | `server_error` | final status is 5xx | ✘ |
@@ -66,6 +77,7 @@ raised. A dead host is a result, not a crash.
 | flag | default | what it does |
 | --- | --- | --- |
 | `--no-status-check` | on | skip the check entirely |
+| `--allow-private-redirects` | off | allow a redirect to a private/loopback/link-local address on a different host than the target, and let `--basic-auth`/`-H` credentials follow a cross-host redirect. Also applies to the browser capture's navigation/iframe handling. |
 | `--status-method {auto,head,get}` | `auto` | `auto` = HEAD with a GET fallback; the others pin the method |
 | `--status-timeout SECONDS` | `15.0` | per-request timeout |
 | `--status-max-redirects N` | `10` | hops to follow; `0` records the first response and stops |

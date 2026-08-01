@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlsplit
 
 from .capture import CaptureOptions
 from .models import RedirectHop, UrlStatus, utcnow
+from .ssrf_guard import is_unsafe_redirect
 
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_MAX_REDIRECTS = 10
@@ -53,6 +54,11 @@ class StatusCheckOptions:
     extra_headers: dict[str, str] = field(default_factory=dict)
     basic_auth: tuple[str, str] | None = None
     verify_tls: bool = True
+    #: A compromised or malicious *target* can redirect the scanner at
+    #: 169.254.169.254, 127.0.0.1, or other internal addresses; on by
+    #: default, blocks such a redirect unless it stays on the same host the
+    #: operator targeted. See ssrf_guard.py.
+    block_private_redirects: bool = True
 
     @classmethod
     def from_capture(cls, capture: CaptureOptions, **overrides: object) -> "StatusCheckOptions":
@@ -88,7 +94,13 @@ class UrlStatusChecker:
         if self._client is None:
             import httpx
 
-            headers = dict(self.options.extra_headers)
+            # Basic-Auth and custom headers are deliberately NOT set here: a
+            # client-level default is attached to every request the client
+            # makes, including hops that land on a different host after a
+            # redirect. They are instead attached per-request in
+            # `_scoped_kwargs`, only when the request stays on the host the
+            # operator targeted.
+            headers = {}
             if self.options.user_agent:
                 headers["User-Agent"] = self.options.user_agent
             self._client = httpx.AsyncClient(
@@ -96,10 +108,23 @@ class UrlStatusChecker:
                 timeout=self.options.timeout_s,
                 verify=self.options.verify_tls,
                 headers=headers,
-                auth=self.options.basic_auth,
             )
         self._semaphore = asyncio.Semaphore(max(1, self.options.max_concurrency))
         return self
+
+    def _scoped_kwargs(self, target_url: str, original_host: str) -> dict:
+        """Basic-Auth/custom headers only for a request that stays on the
+        host the operator targeted — otherwise a redirect (or a checksum
+        fetch of a final URL that ended up on a different host) would
+        silently carry credentials meant for one origin to another."""
+        if (urlsplit(target_url).hostname or "").lower() != original_host:
+            return {"auth": None}
+        kwargs: dict[str, object] = {}
+        if self.options.extra_headers:
+            kwargs["headers"] = dict(self.options.extra_headers)
+        if self.options.basic_auth:
+            kwargs["auth"] = self.options.basic_auth
+        return kwargs
 
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
@@ -134,6 +159,7 @@ class UrlStatusChecker:
         current = url
         method = "GET" if options.method == "get" else "HEAD"
         seen = {url}
+        original_host = (urlsplit(url).hostname or "").lower()
 
         # Checked up front so that any InvalidURL raised below can only be about a
         # redirect target, never about the target we were handed.
@@ -146,7 +172,7 @@ class UrlStatusChecker:
         try:
             while True:
                 hop_started = time.monotonic()
-                response, used_method = await self._request(method, current)
+                response, used_method = await self._request(method, current, original_host)
                 hop = RedirectHop(
                     url=current,
                     status=response.status_code,
@@ -184,6 +210,10 @@ class UrlStatusChecker:
                     status.state = "redirect_broken"
                     status.error = f"redirect loop at {nxt}"
                     break
+                if options.block_private_redirects and await is_unsafe_redirect(url, nxt):
+                    status.state = "redirect_broken"
+                    status.error = f"blocked: redirect to a private/internal address: {hop.location[:120]}"
+                    break
 
                 seen.add(nxt)
                 current = nxt
@@ -212,12 +242,12 @@ class UrlStatusChecker:
         # Only worth a body fetch once we know the target answered as asked: a
         # 404's error page changes for reasons nobody wants to be alerted about.
         if options.checksum and status.ok and status.final_url:
-            await self._add_checksum(status)
+            await self._add_checksum(status, original_host)
 
         status.elapsed_s = time.monotonic() - started
         return status
 
-    async def _add_checksum(self, status: UrlStatus) -> None:
+    async def _add_checksum(self, status: UrlStatus, original_host: str) -> None:
         """Hash the body of the final response, up to the size cap."""
         import httpx
 
@@ -226,9 +256,10 @@ class UrlStatusChecker:
         digest = hashlib.sha256()
         size = 0
         limit = self.options.checksum_max_bytes
+        scoped = self._scoped_kwargs(status.final_url, original_host)
 
         try:
-            async with client.stream("GET", status.final_url) as response:
+            async with client.stream("GET", status.final_url, **scoped) as response:
                 status.content_type = response.headers.get("content-type")
                 if response.status_code not in status.expected_statuses:
                     # The target changed answer between the walk and this fetch.
@@ -263,7 +294,7 @@ class UrlStatusChecker:
         status.content_checksum = digest.hexdigest()
         status.content_length = size
 
-    async def _request(self, method: str, url: str):
+    async def _request(self, method: str, url: str, original_host: str):
         """One hop. Returns ``(response, method_used)``.
 
         A GET is streamed and abandoned once the headers land, so a status check
@@ -271,15 +302,16 @@ class UrlStatusChecker:
         """
         client = self._client
         assert client is not None
+        scoped = self._scoped_kwargs(url, original_host)
 
         if method == "HEAD":
-            response = await client.head(url)
+            response = await client.head(url, **scoped)
             if self.options.method == "auto" and response.status_code in _HEAD_UNSUPPORTED:
-                return await self._stream_get(url), "GET"
+                return await self._stream_get(url, original_host), "GET"
             return response, "HEAD"
-        return await self._stream_get(url), "GET"
+        return await self._stream_get(url, original_host), "GET"
 
-    async def _stream_get(self, url: str):
+    async def _stream_get(self, url: str, original_host: str):
         """A GET whose body is never read.
 
         The response is closed on the way out of the ``with``; only the status
@@ -287,7 +319,8 @@ class UrlStatusChecker:
         """
         client = self._client
         assert client is not None
-        async with client.stream("GET", url) as response:
+        scoped = self._scoped_kwargs(url, original_host)
+        async with client.stream("GET", url, **scoped) as response:
             return response
 
 
