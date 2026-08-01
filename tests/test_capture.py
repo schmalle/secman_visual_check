@@ -4,7 +4,12 @@ import asyncio
 
 import pytest
 
-from secman_visual_check.capture import BrowserCapturer, CaptureOptions, screenshot_filename
+from secman_visual_check.capture import (
+    BrowserCapturer,
+    CaptureOptions,
+    _make_secure_route_handler,
+    screenshot_filename,
+)
 
 
 class FakePage:
@@ -111,3 +116,90 @@ def test_viewport_only_mode(tmp_path):
 def test_capture_requires_the_context_manager(tmp_path):
     with pytest.raises(RuntimeError):
         asyncio.run(make_capturer(tmp_path).capture("https://example.com/"))
+
+
+class FakeRequest:
+    def __init__(self, url, resource_type="document", headers=None):
+        self.url = url
+        self.resource_type = resource_type
+        self._headers = headers or {}
+
+    async def all_headers(self):
+        return dict(self._headers)
+
+
+class FakeRoute:
+    def __init__(self, request):
+        self.request = request
+        self.aborted = False
+        self.continued_with = None
+
+    async def abort(self):
+        self.aborted = True
+
+    async def continue_(self, **kwargs):
+        self.continued_with = kwargs
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+def test_route_handler_aborts_cross_host_redirect_to_a_private_address():
+    handler = _make_secure_route_handler(
+        "https://example.com/", None, None, block_private_redirects=True
+    )
+    route = FakeRoute(FakeRequest("http://169.254.169.254/latest/meta-data/"))
+
+    run(handler(route))
+
+    assert route.aborted is True
+    assert route.continued_with is None
+
+
+def test_route_handler_allows_private_redirect_when_disabled():
+    handler = _make_secure_route_handler(
+        "https://example.com/", None, None, block_private_redirects=False
+    )
+    route = FakeRoute(FakeRequest("http://169.254.169.254/latest/meta-data/"))
+
+    run(handler(route))
+
+    assert route.aborted is False
+
+
+def test_route_handler_injects_credentials_only_for_same_host_requests():
+    handler = _make_secure_route_handler(
+        "https://example.com/",
+        {"X-Scan": "yes"},
+        ("alice", "hunter2"),
+        block_private_redirects=True,
+    )
+    route = FakeRoute(FakeRequest("https://example.com/next", headers={"accept": "*/*"}))
+
+    run(handler(route))
+
+    assert route.aborted is False
+    assert route.continued_with is not None
+    headers = route.continued_with["headers"]
+    assert headers["X-Scan"] == "yes"
+    assert headers["authorization"].startswith("Basic ")
+    assert headers["accept"] == "*/*"  # existing headers preserved
+
+
+def test_route_handler_never_sends_credentials_cross_host():
+    handler = _make_secure_route_handler(
+        "https://example.com/",
+        {"X-Scan": "yes"},
+        ("alice", "hunter2"),
+        block_private_redirects=True,
+    )
+    # A public, non-private cross-host target (e.g. a third-party subresource
+    # or a redirect target) — not blocked, but must never see credentials
+    # meant for example.com.
+    route = FakeRoute(FakeRequest("https://cdn.other-example.com/lib.js", resource_type="script"))
+
+    run(handler(route))
+
+    assert route.aborted is False
+    assert route.continued_with == {}  # continue_() called with no header override

@@ -565,6 +565,7 @@ troubleshooting: [docs/SECMAN_UPLOAD.md](docs/SECMAN_UPLOAD.md).
 | `--max-height 4000` | Clamp full-page screenshots. Infinite-scroll pages otherwise produce enormous images that waste vision tokens. `0` disables the clamp. |
 | `--timeout`, `--wait-until`, `--settle` | Navigation budget, completion signal, and extra settle time for lazy content. |
 | `--insecure` | Ignore TLS certificate errors (common on internal hosts). |
+| `--allow-private-redirects` | Off by default: a target's redirect (status check) or navigation/iframe (browser capture) to a private/loopback/link-local address on a *different* host than the target is blocked, and `--basic-auth`/`-H` headers are only ever sent to the target's own host — a compromised or malicious target should not be able to redirect the scanner at internal infrastructure or cloud metadata endpoints (e.g. `169.254.169.254`), or collect credentials meant for a different site. Pass this flag only when you deliberately scan through a redirector that lands on your own internal infrastructure. |
 | `--respect-robots` | Skip URLs the origin's `robots.txt` disallows. Off by default: you are scanning your own assets. |
 | `--no-json`, `--no-html`, `--no-csv`, `--no-stats` | Drop one of the four default reports. `--json/--html/--csv/--stats PATH` relocate them. |
 | `--link-images` | Link screenshots from the HTML report instead of embedding them, for large scans. |

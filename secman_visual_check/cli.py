@@ -221,6 +221,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--insecure", action="store_true", help="ignore TLS certificate errors"
     )
     browser.add_argument(
+        "--allow-private-redirects",
+        action="store_true",
+        help="do not block a target's redirect (or, for the browser capture, an "
+        "iframe) to a private/loopback/link-local address on a different host "
+        "than the target itself. Off by default: a compromised or malicious "
+        "target could otherwise redirect the scanner at internal "
+        "infrastructure or cloud metadata endpoints (e.g. 169.254.169.254)",
+    )
+    browser.add_argument(
         "-H",
         "--header",
         action="append",
@@ -733,6 +742,7 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
         storage_state=args.storage_state,
         browser_channel=args.browser_channel,
         executable_path=args.browser_executable,
+        block_private_redirects=not args.allow_private_redirects,
     )
 
     categories = load_categories(args.categories_file)
@@ -775,6 +785,7 @@ def build_config(args: argparse.Namespace) -> ScanConfig:
         max_concurrency=max(1, args.status_concurrency),
         checksum=args.status_checksum,
         checksum_max_bytes=max(0, args.status_checksum_max_bytes),
+        block_private_redirects=not args.allow_private_redirects,
     )
 
     if not args.visual_check and not status_check.enabled:

@@ -10,15 +10,25 @@ from secman_visual_check.status import StatusCheckOptions, UrlStatusChecker
 
 
 def run_check(handler, url="https://example.com/", **option_overrides):
-    """Drive UrlStatusChecker.check against a mocked transport."""
+    """Drive UrlStatusChecker.check against a mocked transport.
+
+    Mirrors UrlStatusChecker.__aenter__'s own client construction: Basic-Auth
+    and extra_headers are NOT baked in at the client level (a client-level
+    default would apply to every hop, including a redirect to a different
+    host) — UrlStatusChecker attaches them per-request itself, scoped to the
+    host the operator targeted. Only User-Agent, which carries no
+    origin-specific privilege, is a client-level default here.
+    """
     options = StatusCheckOptions(**option_overrides)
 
     async def main():
+        headers = {}
+        if options.user_agent:
+            headers["User-Agent"] = options.user_agent
         client = httpx.AsyncClient(
             transport=httpx.MockTransport(handler),
             follow_redirects=False,
-            auth=options.basic_auth,
-            headers=_client_headers(options),
+            headers=headers,
         )
         async with UrlStatusChecker(options, client=client) as checker:
             try:
@@ -27,13 +37,6 @@ def run_check(handler, url="https://example.com/", **option_overrides):
                 await client.aclose()
 
     return asyncio.run(main())
-
-
-def _client_headers(options):
-    headers = dict(options.extra_headers)
-    if options.user_agent:
-        headers["User-Agent"] = options.user_agent
-    return headers
 
 
 def responder(routes, default=404):
@@ -137,6 +140,113 @@ def test_redirect_to_an_unparseable_location_stops_the_walk():
 
         assert status.state == "redirect_broken", location
         assert "unusable redirect target" in status.error
+
+
+def test_redirect_to_cloud_metadata_address_is_blocked():
+    status = run_check(
+        responder({"https://example.com/": (302, "http://169.254.169.254/latest/meta-data/")})
+    )
+
+    assert status.state == "redirect_broken"
+    assert status.ok is False
+    assert "blocked" in status.error
+    assert "private/internal" in status.error
+
+
+def test_redirect_to_loopback_on_a_different_host_is_blocked():
+    status = run_check(responder({"https://example.com/": (302, "http://127.0.0.1:8080/admin")}))
+
+    assert status.state == "redirect_broken"
+    assert "blocked" in status.error
+
+
+def test_redirect_to_a_private_address_can_be_allowed_explicitly():
+    # --allow-private-redirects: an operator scanning their own internal
+    # infrastructure via a known redirector must be able to opt back in.
+    status = run_check(
+        responder(
+            {
+                "https://example.com/": (302, "http://10.0.0.5/"),
+                "http://10.0.0.5/": (200, None),
+            }
+        ),
+        block_private_redirects=False,
+    )
+
+    assert status.state == "redirect"
+    assert status.ok is True
+    assert status.final_url == "http://10.0.0.5/"
+
+
+def test_redirect_within_the_same_host_is_never_blocked_regardless_of_address():
+    status = run_check(
+        responder(
+            {
+                "https://example.com/a": (302, "https://example.com/b"),
+                "https://example.com/b": (200, None),
+            }
+        ),
+        url="https://example.com/a",
+    )
+
+    assert status.state == "redirect"
+    assert status.ok is True
+
+
+def test_basic_auth_and_custom_headers_do_not_reach_a_cross_host_redirect_target():
+    seen = {}
+
+    def handler(request):
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"Location": "https://attacker.example/steal"})
+        seen["auth"] = request.headers.get("authorization")
+        seen["custom"] = request.headers.get("x-scan")
+        return httpx.Response(200)
+
+    status = run_check(
+        handler,
+        extra_headers={"X-Scan": "yes"},
+        basic_auth=("alice", "hunter2"),
+    )
+
+    assert status.state == "redirect"
+    assert seen["auth"] is None
+    assert seen["custom"] is None
+
+
+def test_basic_auth_and_custom_headers_reach_a_same_host_redirect_target():
+    seen = {}
+
+    def handler(request):
+        if request.url.path == "/a":
+            return httpx.Response(302, headers={"Location": "/b"})
+        seen["auth"] = request.headers.get("authorization")
+        seen["custom"] = request.headers.get("x-scan")
+        return httpx.Response(200)
+
+    run_check(
+        handler,
+        url="https://example.com/a",
+        extra_headers={"X-Scan": "yes"},
+        basic_auth=("alice", "hunter2"),
+    )
+
+    assert seen["auth"] is not None and seen["auth"].startswith("Basic ")
+    assert seen["custom"] == "yes"
+
+
+def test_checksum_fetch_does_not_carry_credentials_to_a_different_final_host():
+    seen = {}
+
+    def handler(request):
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"Location": "https://other-public-site.example/"})
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, content=b"hello")
+
+    run_check(handler, basic_auth=("alice", "hunter2"))
+
+    assert seen["auth"] is None
 
 
 def test_a_non_http_target_is_rejected_before_any_request_is_made():
