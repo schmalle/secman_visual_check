@@ -44,9 +44,13 @@ single `ScanConfig`, `scanner.run_scan` executes it, and everything downstream
 consumes one `ScanReport`.
 
 ```
+secrets.py ─→ (every credential, before anything runs)
+
 targets.py → status.py ─┐
                         ├→ scanner.py → reporting.py / db.py / mailer.py / secman.py
             capture.py → analyzer.py
+
+plan.py ←── the same options, described instead of executed (--dry-run)
 ```
 
 **Two independent probes per target, deliberately not merged.** `status.py`
@@ -66,7 +70,13 @@ analyzer become `Analysis.error`; only configuration problems raise
 
 **Credentials are validated before the scan, never after.** `main()` builds the
 SecMan, DB and mail options up front so a ten-minute crawl cannot end on a typo.
+Resolving a `pass://` reference happens in the same pass, for the same reason.
 Preserve that ordering when adding a stage.
+
+**`--dry-run` writes nothing and validates everything.** It builds the identical
+option objects a real run would, then hands them to `plan.py` to describe. A new
+stage that writes must either be represented in the plan or be unreachable from
+the dry-run path — the guarantee is worth more than the feature.
 
 ### Stage notes
 
@@ -112,6 +122,16 @@ Preserve that ordering when adding a stage.
   formulas. `report_statistics()` is the single source of the aggregate numbers
   for both the console block and `statistics.txt`; both omit rows for a stage
   that never ran rather than printing zeros.
+- `secrets.py` resolves `pass://vault/item/field` through `pass-cli`, and is the
+  only place that shells out. Two invariants: the secret never reaches argv
+  (only the reference is passed, the value comes back on a pipe), and it never
+  reaches printed output — `redact()` scrubs resolved values out of anything
+  echoed back from a backend, applied via `cli._emit`. `pass-cli`'s flags have
+  moved between releases, so `STRATEGIES` tries each known spelling and caches
+  whichever answered; `scripts/passcli.sh` mirrors the same chain for shell
+  scripts and is exercised through bash in `tests/test_passcli_shell.py`.
+- `plan.py` renders `--dry-run`. It reads the real option objects rather than
+  the argparse namespace, so the plan cannot drift from what a run would do.
 - `models.py` holds the dataclasses every stage shares. `ScanReport`'s
   `severity_counts()` counts *findings*; a result's `max_severity` falls back
   to `INFO` when there are none, so a clean page prints `[INFO]` against a
@@ -133,3 +153,6 @@ Preserve that ordering when adding a stage.
   those paths.
 - User-facing docs live in `README.md` with deep references in `docs/` and
   `db/`. A new flag belongs in the README options table and in its topic doc.
+- Any new credential flag goes through `SecretResolver.resolve()` and gets a row
+  in `docs/PASS_CLI.md`; a flag that reads a secret straight out of the
+  namespace is a bug, not a shortcut.

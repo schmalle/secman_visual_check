@@ -10,6 +10,11 @@
 #   DB_PASSWORD=... db/install.sh
 #   DB_ROOT_PASSWORD=... DB_HOST=db.internal DB_PASSWORD=... db/install.sh
 #
+# Either password may be a Proton Pass reference instead of the secret itself,
+# in which case it is fetched through pass-cli (see scripts/passcli.sh):
+#
+#   DB_PASSWORD='pass://Infra/Scanner DB/password' db/install.sh
+#
 # Environment:
 #   DB_ROOT_USER      administrative user used to create things (default: root)
 #   DB_ROOT_PASSWORD  its password (default: empty, e.g. socket auth)
@@ -20,6 +25,7 @@
 #   DB_PASSWORD       its password (required)
 #   DB_USER_HOST      host the application user may connect from (default: %)
 #   TABLE_PREFIX      table name prefix (default: svc_)
+#   SECMAN_PASS_CLI   pass-cli binary, if it is not on PATH
 
 set -euo pipefail
 
@@ -35,6 +41,16 @@ TABLE_PREFIX="${TABLE_PREFIX:-svc_}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 schema_file="$script_dir/schema.sql"
+passcli_helper="$script_dir/../scripts/passcli.sh"
+
+# Before anything is validated or created: a run that ends on an unresolvable
+# reference should end before it has made a database.
+if [[ -f "$passcli_helper" ]]; then
+  # shellcheck source=../scripts/passcli.sh
+  source "$passcli_helper"
+  secman_resolve_var DB_PASSWORD
+  secman_resolve_var DB_ROOT_PASSWORD
+fi
 
 if [[ -z "$DB_PASSWORD" ]]; then
   echo "error: DB_PASSWORD is required (the password for the application user)" >&2
