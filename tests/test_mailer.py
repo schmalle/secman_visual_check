@@ -195,6 +195,73 @@ def test_message_is_multipart_with_text_first():
 
 
 # --------------------------------------------------------------------------- #
+# Finding 3 — a target that reflects a resolved secret back (e.g. a rejected
+# Basic-Auth password quoted in an error page) must not land in the outgoing
+# message body — scrubbed before Mailer.send ever sees it, not just in a
+# post-send log line.
+# --------------------------------------------------------------------------- #
+
+SECRET = "s3cretPassw0rd"
+
+
+def make_report_with_secret(secret: str = SECRET) -> ScanReport:
+    result = ScanResult(
+        url="https://example.com/",
+        status_check=status(
+            "https://example.com/",
+            state="client_error",
+            final_status=401,
+            error=f"HTTP 401: bad credentials '{secret}'",
+        ),
+    )
+    return make_report(result)
+
+
+def test_build_message_redacts_a_reflected_secret_from_both_parts():
+    message = build_message(make_report_with_secret(), options(), secrets=[SECRET])
+
+    text_body = message.get_body(preferencelist=("plain",)).get_content()
+    html_body = message.get_body(preferencelist=("html",)).get_content()
+
+    assert SECRET not in text_body
+    assert SECRET not in html_body
+    assert "<redacted>" in text_body
+    # Redaction happens before HTML-escaping, so the marker's angle brackets
+    # are escaped like any other rendered text.
+    assert "&lt;redacted&gt;" in html_body
+
+
+def test_build_message_without_secrets_is_unaffected():
+    """The common case — no credential was ever resolved — must not alter
+    the rendered message."""
+    message = build_message(make_report_with_secret(), options())
+
+    text_body = message.get_body(preferencelist=("plain",)).get_content()
+    assert SECRET in text_body
+
+
+def test_send_report_scrubs_the_secret_before_the_mailer_ever_sees_it():
+    """The regression this closes: redaction must happen *before* send(), not
+    only in the post-send console summary."""
+    fake = FakeSmtp()
+
+    summary = send_report(
+        make_report_with_secret(),
+        options(),
+        mailer=SmtpMailer(client=fake),
+        secrets=[SECRET],
+    )
+
+    assert summary.sent is True
+    sent_message = fake.sent[0]
+    text_body = sent_message.get_body(preferencelist=("plain",)).get_content()
+    html_body = sent_message.get_body(preferencelist=("html",)).get_content()
+    assert SECRET not in text_body
+    assert SECRET not in html_body
+    assert SECRET not in sent_message.as_string()
+
+
+# --------------------------------------------------------------------------- #
 # Options
 # --------------------------------------------------------------------------- #
 
