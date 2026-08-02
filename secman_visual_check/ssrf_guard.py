@@ -76,3 +76,25 @@ async def is_unsafe_redirect(original_url: str, redirect_url: str) -> bool:
     if _is_blocked_ip(redirect_host):
         return True
     return await _resolves_to_blocked_ip(redirect_host)
+
+
+async def is_unsafe_destination(url: str) -> bool:
+    """True if ``url``'s host is a private/loopback/link-local/reserved address.
+
+    Unlike :func:`is_unsafe_redirect`, there is no same-host exemption here —
+    that exemption exists because the *original* target is the operator's
+    deliberate choice. This function is for requests where no such original
+    target exists: a page a scanned target's own JavaScript opened itself
+    (``window.open()``, ``target="_blank"``, a form that opens a tab), which
+    Playwright creates as a brand-new page in the shared browser context and
+    does **not** route through the per-target guard installed on the page the
+    operator actually navigated to. The operator never asked to visit that
+    URL at all, so any private destination is blocked outright, regardless of
+    host.
+    """
+    host = (urlsplit(url).hostname or "").lower()
+    if not host:
+        return False
+    if _is_blocked_ip(host):
+        return True
+    return await _resolves_to_blocked_ip(host)
