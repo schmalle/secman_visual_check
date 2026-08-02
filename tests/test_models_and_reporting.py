@@ -13,10 +13,12 @@ from secman_visual_check.models import (
     UrlStatus,
 )
 from secman_visual_check.reporting import (
+    redact_report,
     render_html,
     report_statistics,
     write_console_report,
     write_csv_report,
+    write_html_report,
     write_json_report,
     write_stats_report,
 )
@@ -524,3 +526,157 @@ def test_stats_report_handles_an_empty_run(tmp_path):
     path = write_stats_report(ScanReport(model="test/model"), tmp_path / "statistics.txt")
 
     assert "Targets" in path.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# Finding 3 — a target that reflects a resolved secret back (e.g. a rejected
+# Basic-Auth password quoted in an error page) must not land it in any
+# report format.
+# --------------------------------------------------------------------------- #
+
+SECRET = "s3cretPassw0rd"
+
+
+def make_report_with_secret(secret: str = SECRET) -> ScanReport:
+    """A report shaped like a target that reflected a resolved credential
+    back into every text field a renderer might print."""
+    capture = PageCapture(
+        url="https://example.com/",
+        final_url="https://example.com/",
+        status=401,
+        title=f"Unauthorized for {secret}",
+        text_excerpt=f"Access denied: bad credentials '{secret}'",
+        load_error=f"401 for basic auth {secret}",
+        console_errors=[f"blocked request carrying token {secret}"],
+    )
+    analysis = Analysis(
+        risk_level=Severity.LOW,
+        summary=f"The page reflected the credential {secret} back in its body.",
+        page_type=f"error page mentioning {secret}",
+        findings=[
+            Finding(
+                category=f"leaked_{secret}",
+                severity=Severity.LOW,
+                title=f"Reflected secret {secret}",
+                evidence=f"body contained {secret}",
+                recommendation=f"stop echoing {secret}",
+            )
+        ],
+    )
+    status = UrlStatus(
+        url="https://example.com/",
+        state="client_error",
+        first_status=401,
+        final_status=401,
+        error=f"HTTP 401: {secret}",
+    )
+    report = ScanReport(model="test/model", tool_version="0.2.0")
+    report.results = [
+        ScanResult(
+            url="https://example.com/",
+            capture=capture,
+            status_check=status,
+            analysis=analysis,
+            error=f"failed with {secret}",
+        ),
+    ]
+    return report
+
+
+def test_redact_report_is_a_no_op_without_secrets():
+    report = make_report_with_secret()
+    assert redact_report(report, ()) is report
+
+
+def test_redact_report_scrubs_every_target_influenced_text_field():
+    report = redact_report(make_report_with_secret(), [SECRET])
+    result = report.results[0]
+
+    assert SECRET not in result.capture.title
+    assert SECRET not in result.capture.text_excerpt
+    assert SECRET not in result.capture.load_error
+    assert SECRET not in result.capture.console_errors[0]
+    assert SECRET not in result.status_check.error
+    assert SECRET not in result.analysis.summary
+    assert SECRET not in result.analysis.page_type
+    assert SECRET not in result.analysis.findings[0].category
+    assert SECRET not in result.analysis.findings[0].title
+    assert SECRET not in result.analysis.findings[0].evidence
+    assert SECRET not in result.analysis.findings[0].recommendation
+    assert SECRET not in (result.error or "")
+    assert "<redacted>" in result.capture.title
+
+
+def test_redact_report_leaves_structural_fields_alone():
+    """URLs, status codes and IDs must survive — only free text is scrubbed."""
+    report = redact_report(make_report_with_secret(), [SECRET])
+    result = report.results[0]
+
+    assert result.url == "https://example.com/"
+    assert result.capture.url == "https://example.com/"
+    assert result.capture.final_url == "https://example.com/"
+    assert result.capture.status == 401
+    assert result.status_check.first_status == 401
+    assert result.status_check.final_status == 401
+
+
+def test_json_report_redacts_a_reflected_secret(tmp_path):
+    path = write_json_report(
+        make_report_with_secret(), tmp_path / "report.json", secrets=[SECRET]
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    assert "<redacted>" in text
+
+
+def test_json_report_without_secrets_is_unaffected(tmp_path):
+    """The common case — no credential was ever resolved — must not pay for
+    or alter anything."""
+    path = write_json_report(make_report_with_secret(), tmp_path / "report.json")
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET in text
+
+
+def test_html_report_redacts_a_reflected_secret(tmp_path):
+    path = write_html_report(
+        make_report_with_secret(), tmp_path / "report.html", secrets=[SECRET]
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    # Redaction happens before HTML-escaping, so the marker's angle brackets
+    # are escaped like any other rendered text.
+    assert "&lt;redacted&gt;" in text
+
+
+def test_csv_report_redacts_a_reflected_secret(tmp_path):
+    path = write_csv_report(make_report_with_secret(), tmp_path / "report.csv", secrets=[SECRET])
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    assert "<redacted>" in text
+
+
+def test_console_report_redacts_a_reflected_secret():
+    stream = io.StringIO()
+    write_console_report(
+        make_report_with_secret(), stream=stream, color=False, secrets=[SECRET]
+    )
+    out = stream.getvalue()
+
+    assert SECRET not in out
+    assert "<redacted>" in out
+
+
+def test_stats_report_does_not_leak_a_reflected_secret(tmp_path):
+    """Stats print aggregate counts only, so this is mostly a regression
+    guard: the secret was never in the numeric output, and threading
+    ``secrets`` through must not break that."""
+    path = write_stats_report(
+        make_report_with_secret(), tmp_path / "statistics.txt", secrets=[SECRET]
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text

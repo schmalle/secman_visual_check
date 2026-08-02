@@ -7,10 +7,21 @@ import csv
 import html
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Sequence, TextIO
 
-from .models import STATUS_STATES, ScanReport, ScanResult, Severity, UrlStatus
+from .models import (
+    STATUS_STATES,
+    Analysis,
+    Finding,
+    PageCapture,
+    ScanReport,
+    ScanResult,
+    Severity,
+    UrlStatus,
+)
+from .secrets import redact
 
 SEVERITY_COLORS = {
     Severity.CRITICAL: "\033[1;97;41m",
@@ -63,6 +74,93 @@ STATUS_DISPLAY_ORDER = (
     "unreachable",
     "unknown",
 )
+
+
+# --------------------------------------------------------------------------- #
+# Secret redaction — applied before any renderer below sees the report
+# --------------------------------------------------------------------------- #
+
+#: A resolved credential can legitimately end up inside report content: a
+#: target that reflects request headers (e.g. a rejected Basic-Auth password
+#: passed via ``--basic-auth pass://vault/item/password``) back in its body
+#: or error page puts it in ``capture.text_excerpt``/``load_error``, and from
+#: there into the screenshot's extracted text, the AI analyzer's summary, and
+#: every report format. ``redact_report`` scrubs every such target-influenced
+#: text field before a renderer sees it — structural fields (URLs, status
+#: codes, timestamps, config echoes like ``model``) are left untouched, since
+#: scrubbing those would corrupt the report rather than protect anything.
+
+
+def _redact_or_none(value: str | None, secrets: Sequence[str]) -> str | None:
+    if value is None:
+        return None
+    return redact(value, secrets)
+
+
+def _redact_capture(capture: PageCapture | None, secrets: Sequence[str]) -> PageCapture | None:
+    if capture is None:
+        return None
+    return replace(
+        capture,
+        title=_redact_or_none(capture.title, secrets),
+        text_excerpt=redact(capture.text_excerpt, secrets),
+        load_error=_redact_or_none(capture.load_error, secrets),
+        console_errors=[redact(entry, secrets) for entry in capture.console_errors],
+    )
+
+
+def _redact_status(status: UrlStatus | None, secrets: Sequence[str]) -> UrlStatus | None:
+    if status is None:
+        return None
+    return replace(status, error=_redact_or_none(status.error, secrets))
+
+
+def _redact_finding(finding: Finding, secrets: Sequence[str]) -> Finding:
+    return replace(
+        finding,
+        category=redact(finding.category, secrets),
+        title=redact(finding.title, secrets),
+        evidence=redact(finding.evidence, secrets),
+        recommendation=redact(finding.recommendation, secrets),
+    )
+
+
+def _redact_analysis(analysis: Analysis | None, secrets: Sequence[str]) -> Analysis | None:
+    if analysis is None:
+        return None
+    return replace(
+        analysis,
+        summary=redact(analysis.summary, secrets),
+        page_type=redact(analysis.page_type, secrets),
+        error=_redact_or_none(analysis.error, secrets),
+        findings=[_redact_finding(f, secrets) for f in analysis.findings],
+    )
+
+
+def _redact_result(result: ScanResult, secrets: Sequence[str]) -> ScanResult:
+    return replace(
+        result,
+        error=_redact_or_none(result.error, secrets),
+        skipped_reason=_redact_or_none(result.skipped_reason, secrets),
+        capture=_redact_capture(result.capture, secrets),
+        status_check=_redact_status(result.status_check, secrets),
+        analysis=_redact_analysis(result.analysis, secrets),
+    )
+
+
+def redact_report(report: ScanReport, secrets: Sequence[str]) -> ScanReport:
+    """Return a copy of ``report`` with every target-influenced text field
+    scrubbed of any resolved secret value in ``secrets``.
+
+    A no-op (returns ``report`` itself) when ``secrets`` is empty — the
+    common case, and the reason every writer below can call this
+    unconditionally without a cost when no credential was ever resolved.
+    Shared with ``mailer.build_message``, so the outgoing email body gets the
+    same scrubbing as the on-disk reports.
+    """
+    if not secrets:
+        return report
+    return replace(report, results=[_redact_result(r, secrets) for r in report.results])
 
 
 def checksum_summary(status: UrlStatus) -> str:
@@ -126,7 +224,9 @@ def write_console_report(
     color: bool | None = None,
     verbose: bool = False,
     statistics: bool = True,
+    secrets: Sequence[str] = (),
 ) -> None:
+    report = redact_report(report, secrets)
     out = stream or sys.stdout
     use_color = should_colorize(out, color)
 
@@ -326,7 +426,10 @@ def _write_result(result: ScanResult, out: TextIO, use_color: bool, verbose: boo
                 print(f"      fix: {finding.recommendation[:300]}", file=out)
 
 
-def write_json_report(report: ScanReport, path: Path, include_raw: bool = False) -> Path:
+def write_json_report(
+    report: ScanReport, path: Path, include_raw: bool = False, secrets: Sequence[str] = ()
+) -> Path:
+    report = redact_report(report, secrets)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(report.to_dict(include_raw), indent=2, ensure_ascii=False),
@@ -335,7 +438,10 @@ def write_json_report(report: ScanReport, path: Path, include_raw: bool = False)
     return path
 
 
-def write_html_report(report: ScanReport, path: Path, embed_images: bool = True) -> Path:
+def write_html_report(
+    report: ScanReport, path: Path, embed_images: bool = True, secrets: Sequence[str] = ()
+) -> Path:
+    report = redact_report(report, secrets)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_html(report, path.parent, embed_images), encoding="utf-8")
     return path
@@ -418,7 +524,8 @@ def csv_rows(report: ScanReport) -> list[dict[str, str]]:
     return rows
 
 
-def write_csv_report(report: ScanReport, path: Path) -> Path:
+def write_csv_report(report: ScanReport, path: Path, secrets: Sequence[str] = ()) -> Path:
+    report = redact_report(report, secrets)
     path.parent.mkdir(parents=True, exist_ok=True)
     # newline="" per the csv module: it writes \r\n itself.
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -568,7 +675,12 @@ def render_stats(report: ScanReport) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_stats_report(report: ScanReport, path: Path) -> Path:
+def write_stats_report(report: ScanReport, path: Path, secrets: Sequence[str] = ()) -> Path:
+    # render_stats only ever prints aggregate counts and structural fields
+    # (model, timestamps) — never a target-influenced text field — but the
+    # report is still redacted here for the same reason every other writer
+    # is: a future stats field must opt into leaking, not opt out of it.
+    report = redact_report(report, secrets)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_stats(report), encoding="utf-8")
     return path

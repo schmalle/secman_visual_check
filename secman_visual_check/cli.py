@@ -1242,23 +1242,26 @@ def main(argv: list[str] | None = None) -> int:
         color=should_colorize(sys.stdout, args.color),
         verbose=args.verbose,
         statistics=not args.no_stats,
+        secrets=resolver.values,
     )
 
     if not args.no_json:
         path = Path(args.json) if args.json else config.output_dir / "report.json"
-        write_json_report(report, path, include_raw=args.include_raw)
+        write_json_report(report, path, include_raw=args.include_raw, secrets=resolver.values)
         print(f"\nJSON report: {path}")
     if not args.no_html:
         path = Path(args.html) if args.html else config.output_dir / "report.html"
-        write_html_report(report, path, embed_images=not args.link_images)
+        write_html_report(
+            report, path, embed_images=not args.link_images, secrets=resolver.values
+        )
         print(f"HTML report: {path}")
     if not args.no_csv:
         path = Path(args.csv) if args.csv else config.output_dir / "report.csv"
-        write_csv_report(report, path)
+        write_csv_report(report, path, secrets=resolver.values)
         print(f"CSV report: {path}")
     if not args.no_stats:
         path = Path(args.stats) if args.stats else config.output_dir / "statistics.txt"
-        write_stats_report(report, path)
+        write_stats_report(report, path, secrets=resolver.values)
         print(f"Statistics: {path}")
 
     db_status = EXIT_OK
@@ -1278,6 +1281,7 @@ def main(argv: list[str] | None = None) -> int:
             mail_options,
             flag_changes=flag_changes,
             dashboard_url=args.mail_dashboard_url,
+            secrets=resolver.values,
         )
         _emit(write_mail_report, mail_summary, secrets=resolver.values)
 

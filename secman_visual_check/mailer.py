@@ -22,6 +22,7 @@ from email.utils import formataddr, parseaddr
 from typing import Any, Sequence, TextIO
 
 from .models import ScanReport, Severity
+from .reporting import redact_report
 
 DEFAULT_SUBJECT_PREFIX = "[secman-visual-check]"
 DEFAULT_TIMEOUT_S = 30.0
@@ -398,8 +399,19 @@ def build_message(
     options: MailOptions,
     flag_changes: Sequence[Any] = (),
     dashboard_url: str | None = None,
+    secrets: Sequence[str] = (),
 ) -> EmailMessage:
-    """A multipart/alternative message with the text part first, as MIME requires."""
+    """A multipart/alternative message with the text part first, as MIME requires.
+
+    ``secrets`` (typically ``resolver.values`` from the CLI's
+    :class:`~secman_visual_check.secrets.SecretResolver`) is scrubbed out of
+    the report *before* rendering, via the same :func:`~secman_visual_check.
+    reporting.redact_report` the on-disk reports use — a target that reflects
+    a resolved credential back (e.g. in a rejected Basic-Auth error page)
+    must not get it into the message body that is about to be sent, not just
+    into a post-send log line.
+    """
+    report = redact_report(report, secrets)
     message = EmailMessage()
     message["Subject"] = build_subject(report, flag_changes, options.subject_prefix)
     message["From"] = (
@@ -612,11 +624,14 @@ def send_report(
     flag_changes: Sequence[Any] = (),
     mailer: Mailer | None = None,
     dashboard_url: str | None = None,
+    secrets: Sequence[str] = (),
 ) -> MailSummary:
     """Render and deliver the result email. Never raises.
 
     A mail problem is reported, not propagated: the scan already succeeded and
-    its reports are already on disk.
+    its reports are already on disk. ``secrets`` is forwarded to
+    :func:`build_message` so the message body is redacted before ``mailer``
+    ever sends it — see that function's docstring.
     """
     summary = MailSummary(
         enabled=options.enabled,
@@ -635,7 +650,7 @@ def send_report(
         return summary
 
     try:
-        message = build_message(report, options, flag_changes, dashboard_url)
+        message = build_message(report, options, flag_changes, dashboard_url, secrets)
         summary.subject = str(message["Subject"])
         if options.dry_run:
             return summary

@@ -1,6 +1,6 @@
 import asyncio
 
-from secman_visual_check.ssrf_guard import is_unsafe_redirect, same_host
+from secman_visual_check.ssrf_guard import is_unsafe_destination, is_unsafe_redirect, same_host
 
 
 def run(coro):
@@ -45,3 +45,36 @@ def test_unresolvable_host_is_not_treated_as_unsafe():
             "https://monitored.example/", "https://this-host-should-not-resolve.invalid/"
         )
     )
+
+
+# --------------------------------------------------------------------------- #
+# is_unsafe_destination — no "operator's target" to exempt, unlike
+# is_unsafe_redirect. Used for pages the scanner never asked to visit at all
+# (a popup a scanned target's own JS opened via window.open()).
+# --------------------------------------------------------------------------- #
+
+
+def test_destination_metadata_ip_is_unsafe():
+    assert run(is_unsafe_destination("http://169.254.169.254/latest/meta-data/"))
+
+
+def test_destination_loopback_is_unsafe():
+    assert run(is_unsafe_destination("http://127.0.0.1:8080/admin"))
+
+
+def test_destination_private_range_is_unsafe():
+    assert run(is_unsafe_destination("http://10.0.0.5/"))
+
+
+def test_destination_public_host_is_safe():
+    assert not run(is_unsafe_destination("https://other-public-site.example/"))
+
+
+def test_destination_unresolvable_host_is_not_treated_as_unsafe():
+    assert not run(is_unsafe_destination("https://this-host-should-not-resolve.invalid/"))
+
+
+def test_destination_has_no_same_host_exemption():
+    # A private IP is unsafe regardless of what "host" it might otherwise be
+    # compared against — there is no operator-chosen original URL here.
+    assert run(is_unsafe_destination("http://169.254.169.254/"))

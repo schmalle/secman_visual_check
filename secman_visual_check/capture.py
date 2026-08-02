@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .models import PageCapture
-from .ssrf_guard import is_unsafe_redirect, same_host
+from .ssrf_guard import is_unsafe_destination, is_unsafe_redirect, same_host
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -26,23 +26,33 @@ def _make_secure_route_handler(
 ):
     """Build a Playwright route handler that:
 
-    1. Aborts document navigations (main frame or iframe — a redirect or an
-       embedded frame) that land on a private/internal address on a
-       different host than ``original_url`` (SSRF guard, see ssrf_guard.py).
+    1. Aborts *any* request the page makes — navigation (main frame or
+       iframe), or a subresource the page's own JS issues (``fetch``,
+       ``xhr``, ``script``, ``image``, ``beacon``, ...) — that lands on a
+       private/internal address on a different host than ``original_url``
+       (SSRF guard, see ssrf_guard.py). This intentionally covers more than
+       navigations: a page can blind-SSRF an internal host via ``fetch()``
+       just as easily as via a redirect, and if the response is written into
+       the DOM it flows straight into ``capture.text_excerpt`` and from there
+       into the screenshot, the AI analyzer and the reports — an
+       exfiltration path, not just an availability one.
     2. Attaches ``extra_headers``/``basic_auth`` only to requests that stay
        on ``original_url``'s host — never to a redirect target, an embedded
        cross-origin iframe, or a third-party subresource (ads, trackers,
        CDNs), which would otherwise silently receive credentials meant for
        one origin.
+
+    Registered on the specific :class:`~playwright.async_api.Page` this
+    capture navigates (``page.route()``), so it never sees a popup/new-tab
+    page a scanned target opens via ``window.open()`` — Playwright does not
+    route those through a page-level handler. That gap is covered separately
+    by the browser-context-level guard installed once in
+    ``BrowserCapturer.__aenter__`` (:func:`_make_context_guard_handler`).
     """
 
     async def handler(route):
         request = route.request
-        if (
-            block_private_redirects
-            and request.resource_type == "document"
-            and await is_unsafe_redirect(original_url, request.url)
-        ):
+        if block_private_redirects and await is_unsafe_redirect(original_url, request.url):
             await route.abort()
             return
 
@@ -57,6 +67,42 @@ def _make_secure_route_handler(
             await route.continue_(headers=headers)
             return
 
+        await route.continue_()
+
+    return handler
+
+
+def _make_context_guard_handler(block_private_redirects: bool):
+    """Build the browser-context-level route handler that closes the popup gap.
+
+    ``_make_secure_route_handler`` above is installed per-page (``page.route``)
+    on the single ``Page`` each ``capture()`` call navigates. Playwright does
+    **not** apply a page-level route to a new page a scanned target's own JS
+    opens via ``window.open()``, ``target="_blank"``, or a form that opens a
+    tab — that page is created fresh in the same shared
+    :class:`~playwright.async_api.BrowserContext` with no interception at
+    all, so without this handler a malicious target could
+    ``window.open('http://169.254.169.254/latest/meta-data/...')`` (or any
+    internal host) and Chromium would fetch it completely unrestricted.
+
+    Installed once via ``context.route()`` in ``BrowserCapturer.__aenter__``,
+    so it applies to every page ever created in that context — the intended
+    pages this capturer navigates *and* any popup. For the intended pages the
+    per-page handler above always resolves the route itself (abort/continue,
+    never ``route.fallback()``), so this handler never actually runs for
+    them; it only ever fires for a page nothing else is guarding.
+
+    Deliberately narrower than the per-page handler: there is no "operator's
+    target" to scope same-host credential injection to here (a popup was not
+    a URL the operator ever typed), so this only ever blocks or continues —
+    it never attaches ``extra_headers``/``basic_auth`` to anything.
+    """
+
+    async def handler(route):
+        request = route.request
+        if block_private_redirects and await is_unsafe_destination(request.url):
+            await route.abort()
+            return
         await route.continue_()
 
     return handler
@@ -179,6 +225,16 @@ class BrowserCapturer:
 
         self._context = await self._browser.new_context(**context_kwargs)
         self._context.set_default_timeout(self.options.timeout_ms)
+        # Context-level SSRF safety net (see _make_context_guard_handler): a
+        # popup/new-tab page a scanned target opens via window.open() is not
+        # covered by the per-page route capture() installs below, since
+        # Playwright does not apply page-level routes to a page it did not
+        # register them on. Registered once, for the life of the browser, so
+        # it covers every page this context ever creates.
+        if self.options.block_private_redirects:
+            await self._context.route(
+                "**/*", _make_context_guard_handler(self.options.block_private_redirects)
+            )
         self._screenshot_lock = asyncio.Lock()
         return self
 
