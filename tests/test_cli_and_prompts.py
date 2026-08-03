@@ -197,6 +197,27 @@ def test_progress_hook_without_a_status_check_is_unchanged(capsys):
     assert capsys.readouterr().err.strip() == "[1/1] https://example.com/ -> info"
 
 
+def test_progress_hook_redacts_a_resolved_secret_in_a_load_error(capsys):
+    # A target that reflects a rejected --basic-auth password back in its error
+    # page puts it straight into capture.load_error — the same leak path
+    # reporting.redact_report scrubs for the on-disk reports. The live
+    # progress line streamed to stderr during the scan must get the same
+    # treatment, not just the final report.
+    result = ScanResult(
+        url="https://example.com/",
+        capture=PageCapture(
+            url="https://example.com/",
+            load_error="401 Unauthorized: bad credentials s3cr3t-p4ssw0rd",
+        ),
+    )
+
+    _progress_hook(quiet=False, secrets=["s3cr3t-p4ssw0rd"])(result, 1, 1)
+    err = capsys.readouterr().err
+
+    assert "s3cr3t-p4ssw0rd" not in err
+    assert "<redacted>" in err
+
+
 def test_secman_status_flags_reach_the_options():
     options = build_secman_options(
         parse(
