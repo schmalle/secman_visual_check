@@ -1058,7 +1058,19 @@ def _run_secman_upload(
     return EXIT_OK
 
 
-def _progress_hook(quiet: bool):
+def _progress_hook(quiet: bool, secrets: Sequence[str] = ()):
+    """Build the per-target progress callback streamed to stderr during the scan.
+
+    Unlike every other writer (``write_console_report``, ``_emit``, ...), this
+    runs *while the scan is still in flight*, one line per target as it
+    finishes — so it cannot go through ``redact_report``, which only ever sees
+    the finished ``ScanReport``. ``result.capture.load_error`` can carry a
+    resolved credential straight off the wire (a target that reflects a
+    rejected ``--basic-auth`` password back in its error page, per
+    ``reporting.redact_report``'s docstring), so the line is scrubbed here,
+    the same way, before it reaches the terminal or a CI log.
+    """
+
     def hook(result: ScanResult, done: int, total: int) -> None:
         if quiet:
             return
@@ -1071,7 +1083,8 @@ def _progress_hook(quiet: bool):
         else:
             state = result.max_severity.value
         prefix = f"{result.status_check.label} | " if result.status_check else ""
-        print(f"[{done}/{total}] {result.url} -> {prefix}{state}", file=sys.stderr, flush=True)
+        line = f"[{done}/{total}] {result.url} -> {prefix}{state}"
+        print(redact(line, secrets), file=sys.stderr, flush=True)
 
     return hook
 
@@ -1223,7 +1236,7 @@ def main(argv: list[str] | None = None) -> int:
             run_scan(
                 targets,
                 config,
-                progress=_progress_hook(args.quiet),
+                progress=_progress_hook(args.quiet, resolver.values),
                 tool_version=__version__,
             )
         )
