@@ -134,6 +134,11 @@ def _redact_analysis(analysis: Analysis | None, secrets: Sequence[str]) -> Analy
         page_type=redact(analysis.page_type, secrets),
         error=_redact_or_none(analysis.error, secrets),
         findings=[_redact_finding(f, secrets) for f in analysis.findings],
+        # The model can quote page content back verbatim, so a secret that ever
+        # reached the prompt can reappear here too. Only surfaced via
+        # --include-raw, but redact_report must not leave any text field opted
+        # out by omission.
+        raw_response=_redact_or_none(analysis.raw_response, secrets),
     )
 
 
