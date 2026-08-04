@@ -562,6 +562,8 @@ def make_report_with_secret(secret: str = SECRET) -> ScanReport:
                 recommendation=f"stop echoing {secret}",
             )
         ],
+        # The model can quote page content back verbatim in its raw reply.
+        raw_response=f'{{"summary": "saw credential {secret} on the page"}}',
     )
     status = UrlStatus(
         url="https://example.com/",
@@ -604,7 +606,20 @@ def test_redact_report_scrubs_every_target_influenced_text_field():
     assert SECRET not in result.analysis.findings[0].evidence
     assert SECRET not in result.analysis.findings[0].recommendation
     assert SECRET not in (result.error or "")
+    assert SECRET not in (result.analysis.raw_response or "")
     assert "<redacted>" in result.capture.title
+
+
+def test_json_report_with_include_raw_redacts_the_models_raw_reply(tmp_path):
+    """--include-raw must not reopen the hole redact_report otherwise closes:
+    the model can quote a leaked secret back verbatim in its raw response."""
+    path = write_json_report(
+        make_report_with_secret(), tmp_path / "report.json", include_raw=True, secrets=[SECRET]
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    assert "raw_response" in text
 
 
 def test_redact_report_leaves_structural_fields_alone():

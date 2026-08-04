@@ -21,11 +21,17 @@ async def run_scan(
     config: ScanConfig,
     progress: ProgressHook | None = None,
     tool_version: str = "",
+    secrets: Sequence[str] = (),
 ) -> ScanReport:
     """Capture and analyse every target, with independent concurrency limits.
 
     Capture and analysis are pipelined per target: one page can be analysed while
     another is still loading, so the AI round-trip does not stall the browser.
+
+    ``secrets`` (``resolver.values``) is forwarded to the analyzer so a resolved
+    credential a target reflects back is scrubbed out of the prompt before it
+    ever reaches the third-party AI provider — see
+    :meth:`~secman_visual_check.analyzer.VisionAnalyzer.analyze`.
     """
     report = ScanReport(
         started_at=utcnow(),
@@ -80,7 +86,7 @@ async def run_scan(
                             result.capture = await capturer.capture(url)
                         if analyzer is not None and result.capture.worth_analyzing:
                             async with analysis_sem:
-                                result.analysis = await analyzer.analyze(result.capture)
+                                result.analysis = await analyzer.analyze(result.capture, secrets)
             except Exception as exc:
                 result.error = f"{type(exc).__name__}: {exc}"[:400]
 

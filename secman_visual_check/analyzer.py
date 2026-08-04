@@ -7,13 +7,14 @@ import base64
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Sequence
 
 from .categories import Category
 from .models import Analysis, Finding, PageCapture, Severity
 from .prompts import RESPONSE_SCHEMA, SYSTEM_PROMPT, build_user_prompt
+from .secrets import redact
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -82,8 +83,20 @@ class VisionAnalyzer:
         if self._client is not None:
             await self._client.aclose()
 
-    async def analyze(self, capture: PageCapture) -> Analysis:
-        """Analyse one capture. Transport failures become Analysis.error, not raises."""
+    async def analyze(self, capture: PageCapture, secrets: Sequence[str] = ()) -> Analysis:
+        """Analyse one capture. Transport failures become Analysis.error, not raises.
+
+        ``secrets`` (typically ``resolver.values`` from the CLI's
+        :class:`~secman_visual_check.secrets.SecretResolver`) is scrubbed out of
+        the capture *before* it is turned into a prompt: a target that reflects a
+        resolved credential back — a Basic-Auth password rejected onto an error
+        page, a custom header echoed in a debug response — lands in
+        ``capture.text_excerpt``/``title``/``load_error`` and, unless stopped here,
+        would be sent verbatim to a third-party AI provider. ``reporting.
+        redact_report`` scrubs the same fields for on-disk reports and email, but
+        that happens *after* this request has already gone out, so it cannot
+        protect the outbound prompt on its own.
+        """
         started = time.monotonic()
         if not capture.screenshot_path:
             return Analysis(
@@ -93,8 +106,9 @@ class VisionAnalyzer:
                 error="missing screenshot",
             )
 
+        safe_capture = _redact_capture_for_prompt(capture, secrets)
         prompt = build_user_prompt(
-            capture,
+            safe_capture,
             self.categories,
             extra_instructions=self.options.extra_instructions,
             text_excerpt_chars=self.options.prompt_text_chars,
@@ -211,6 +225,19 @@ class VisionAnalyzer:
             body["response_format"] = {"type": "json_object"}
         body.update(self.options.extra_body)
         return body
+
+
+def _redact_capture_for_prompt(capture: PageCapture, secrets: Sequence[str]) -> PageCapture:
+    """Scrub resolved secrets out of the target-influenced fields before they
+    ever reach ``build_user_prompt`` — see :meth:`VisionAnalyzer.analyze`."""
+    if not secrets:
+        return capture
+    return replace(
+        capture,
+        title=redact(capture.title, secrets) if capture.title else capture.title,
+        text_excerpt=redact(capture.text_excerpt, secrets),
+        load_error=redact(capture.load_error, secrets) if capture.load_error else capture.load_error,
+    )
 
 
 def parse_analysis(raw_text: str, model: str) -> Analysis:

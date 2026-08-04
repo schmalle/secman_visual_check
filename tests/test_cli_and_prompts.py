@@ -444,7 +444,7 @@ def _stub_scan(monkeypatch):
     """Run main() without a browser, a model or the network."""
     from secman_visual_check.models import ScanReport
 
-    async def fake_run_scan(targets, config, progress=None, tool_version=""):
+    async def fake_run_scan(targets, config, progress=None, tool_version="", secrets=()):
         report = ScanReport(model="test/model", tool_version=tool_version)
         report.results = [
             ScanResult(

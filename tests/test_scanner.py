@@ -66,6 +66,7 @@ class FakeAnalyzer:
     def __init__(self, options, categories):
         self.options = options
         self.analyzed: list[str] = []
+        self.secrets_seen: list[tuple] = []
 
     async def __aenter__(self):
         return self
@@ -73,8 +74,9 @@ class FakeAnalyzer:
     async def __aexit__(self, *exc):
         return None
 
-    async def analyze(self, capture):
+    async def analyze(self, capture, secrets=()):
         self.analyzed.append(capture.url)
+        self.secrets_seen.append(tuple(secrets))
         return Analysis(
             risk_level=Severity.HIGH,
             summary="stub",
@@ -117,6 +119,22 @@ def test_scan_captures_and_analyses_every_target(patched, tmp_path):
     assert report.tool_version == "9.9"
     assert report.finished_at is not None
     assert report.max_severity is Severity.HIGH
+
+
+def test_secrets_are_forwarded_to_the_analyzer(patched, tmp_path):
+    """run_scan's secrets parameter must reach VisionAnalyzer.analyze so a
+    resolved credential a target reflects back gets scrubbed before the
+    prompt is built — see analyzer._redact_capture_for_prompt."""
+    targets = ["https://a.example/", "https://b.example/"]
+    asyncio.run(
+        scanner.run_scan(targets, make_config(tmp_path), secrets=["s3cret-value"])
+    )
+    assert patched["analyzer"].secrets_seen == [("s3cret-value",), ("s3cret-value",)]
+
+
+def test_no_secrets_defaults_to_an_empty_sequence(patched, tmp_path):
+    asyncio.run(scanner.run_scan(["https://a.example/"], make_config(tmp_path)))
+    assert patched["analyzer"].secrets_seen == [()]
 
 
 def test_browser_error_pages_are_not_sent_to_the_model(patched, tmp_path):

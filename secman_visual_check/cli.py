@@ -1225,6 +1225,7 @@ def main(argv: list[str] | None = None) -> int:
                 config,
                 progress=_progress_hook(args.quiet),
                 tool_version=__version__,
+                secrets=resolver.values,
             )
         )
     except AnalyzerError as exc:

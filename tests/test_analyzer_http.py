@@ -156,6 +156,57 @@ def test_bad_api_key_aborts_the_run(screenshot):
         run_analysis(handler, screenshot)
 
 
+def test_secrets_are_scrubbed_from_the_prompt_before_it_is_sent(screenshot):
+    """A target that reflects a resolved credential back (Basic-Auth password,
+    custom header value) in its page text must not have that value forwarded
+    to the third-party AI provider — see analyzer._redact_capture_for_prompt."""
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=completion(json.dumps(VERDICT)))
+
+    secret = "sup3r-Secret-Passw0rd"
+    options = AnalyzerOptions(api_key="sk-test", model="mock/vision")
+    capture = PageCapture(
+        url="https://example.com/",
+        status=401,
+        title=f"Login failed for user admin:{secret}",
+        text_excerpt=f"Access denied. Basic realm rejected credential {secret}.",
+        load_error=f"401 with header X-Auth: {secret}",
+        screenshot_path=str(screenshot),
+    )
+
+    async def go():
+        analyzer = VisionAnalyzer(options, DEFAULT_CATEGORIES)
+        async with analyzer:
+            await analyzer._client.aclose()
+            analyzer._client = httpx.AsyncClient(
+                base_url="https://api.test/v1", transport=httpx.MockTransport(handler)
+            )
+            return await analyzer.analyze(capture, secrets=[secret])
+
+    analysis = asyncio.run(go())
+    assert analysis.error is None
+
+    text_part = seen["body"]["messages"][1]["content"][0]["text"]
+    assert secret not in text_part
+    assert "<redacted>" in text_part
+    # The capture object handed to analyze() is the caller's; it must not be
+    # mutated, so the report writers still see the original (later redacted
+    # separately by reporting.redact_report before anything is written out).
+    assert secret in capture.title
+    assert secret in capture.text_excerpt
+
+
+def test_no_secrets_leaves_the_prompt_untouched(screenshot):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=completion(json.dumps(VERDICT)))
+
+    analysis, _ = run_analysis(handler, screenshot)
+    assert analysis.error is None
+
+
 def test_missing_screenshot_short_circuits():
     options = AnalyzerOptions(api_key="sk-test")
 
