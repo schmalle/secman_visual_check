@@ -25,6 +25,25 @@ def test_lowercases_scheme():
     assert normalize_url("HTTPS://example.com/x") == "https://example.com/x"
 
 
+def test_strips_embedded_userinfo():
+    # This tool never reads credentials out of the URL (only --basic-auth is
+    # honoured for authentication), so a `user:pass@` prefix is pure
+    # liability: it would otherwise ride untouched into every report and,
+    # via --secman-register-assets, into SecMan's own asset inventory.
+    assert normalize_url("https://user:s3cr3t@example.com/admin") == "https://example.com/admin"
+
+
+def test_strips_embedded_userinfo_without_password():
+    assert normalize_url("https://svc-account@example.com/") == "https://example.com/"
+
+
+def test_strips_embedded_userinfo_preserves_port():
+    assert (
+        normalize_url("http://user:pass@example.com:8080/x")
+        == "http://example.com:8080/x"
+    )
+
+
 @pytest.mark.parametrize(
     "bad",
     ["", "   ", "ftp://example.com", "javascript:alert(1)", "file:///etc/passwd", "https://"],
