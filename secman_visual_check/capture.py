@@ -17,6 +17,26 @@ from .ssrf_guard import is_unsafe_destination, is_unsafe_redirect, same_host
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
+#: Both route handlers below validate a redirect/popup hostname with
+#: `ssrf_guard`'s own DNS lookup and then, on success, call
+#: `route.continue_()` to let *Chromium* make the actual connection — which
+#: performs its own, independent DNS resolution moments later. An attacker
+#: controlling DNS for the target with a zero-TTL record can answer safely
+#: for the guard's lookup and flip to a private address before Chromium's
+#: own lookup runs (DNS rebinding), bypassing the guard.
+#:
+#: `status.py` closes the equivalent window by pinning the validated address
+#: (`UrlStatusChecker._request_target`) and setting the `Host` header itself.
+#: That is not available here: Playwright's `route.continue_(url=..., headers=...)`
+#: explicitly refuses to override the `Host` header (it is on the Fetch spec's
+#: forbidden-header list — see the `continue_()` docstring), so rewriting the
+#: URL to the validated IP would send that IP as `Host`, breaking every
+#: name-based-virtual-hosted or SNI-routed site behind it. Closing this gap
+#: for real would mean fronting Chromium through a small local proxy that
+#: re-validates and pins on its own connect (`--proxy-server`), which is a
+#: bigger architectural change than a route handler can make — tracked as a
+#: known limitation rather than silently left unmentioned.
+
 
 def _make_secure_route_handler(
     original_url: str,
