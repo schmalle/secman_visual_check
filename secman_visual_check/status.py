@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlsplit
 
 from .capture import CaptureOptions
 from .models import RedirectHop, UrlStatus, utcnow
-from .ssrf_guard import is_unsafe_redirect
+from .ssrf_guard import check_redirect
 
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_MAX_REDIRECTS = 10
@@ -126,6 +126,38 @@ class UrlStatusChecker:
             kwargs["auth"] = self.options.basic_auth
         return kwargs
 
+    def _request_target(self, url: str, original_host: str, pin: str | None) -> tuple[str, dict]:
+        """Resolve the (url, kwargs) pair to actually connect with.
+
+        When ``pin`` is set — a validated address captured by
+        ``ssrf_guard.check_redirect`` for a cross-host hop — the connection is
+        made to that literal address rather than letting httpx resolve the
+        hostname itself a second time. httpx/httpcore would otherwise redo
+        the DNS lookup at connect time, moments after the guard's own lookup;
+        an attacker controlling DNS for the redirect target with a zero-TTL
+        record can answer safely for the guard's check and then flip to a
+        private address for the connection that follows (DNS rebinding),
+        bypassing the guard entirely. The ``Host`` header and TLS SNI are
+        still set to the real hostname (via the ``sni_hostname`` extension,
+        httpx/httpcore's documented DNS-pinning mechanism), so certificate
+        validation and name-based virtual hosting behave exactly as they
+        would connecting to the hostname directly.
+        """
+        kwargs = self._scoped_kwargs(url, original_host)
+        if not pin:
+            return url, kwargs
+        parts = urlsplit(url)
+        host = parts.hostname or ""
+        netloc = f"[{pin}]" if ":" in pin else pin
+        if parts.port:
+            netloc = f"{netloc}:{parts.port}"
+        pinned_url = parts._replace(netloc=netloc).geturl()
+        headers = dict(kwargs.get("headers") or {})
+        headers["Host"] = host
+        kwargs["headers"] = headers
+        kwargs["extensions"] = {"sni_hostname": host}
+        return pinned_url, kwargs
+
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
 
@@ -157,6 +189,11 @@ class UrlStatusChecker:
         )
         started = time.monotonic()
         current = url
+        #: Address to pin the connection for ``current`` to, when it is a
+        #: validated cross-host redirect target — see ``_request_target``.
+        #: ``None`` for the initial target: it is the operator's own
+        #: deliberate choice, never guarded, so there is nothing to pin to.
+        pin: str | None = None
         method = "GET" if options.method == "get" else "HEAD"
         seen = {url}
         original_host = (urlsplit(url).hostname or "").lower()
@@ -172,7 +209,7 @@ class UrlStatusChecker:
         try:
             while True:
                 hop_started = time.monotonic()
-                response, used_method = await self._request(method, current, original_host)
+                response, used_method = await self._request(method, current, original_host, pin)
                 hop = RedirectHop(
                     url=current,
                     status=response.status_code,
@@ -210,13 +247,18 @@ class UrlStatusChecker:
                     status.state = "redirect_broken"
                     status.error = f"redirect loop at {nxt}"
                     break
-                if options.block_private_redirects and await is_unsafe_redirect(url, nxt):
-                    status.state = "redirect_broken"
-                    status.error = f"blocked: redirect to a private/internal address: {hop.location[:120]}"
-                    break
+                next_pin: str | None = None
+                if options.block_private_redirects:
+                    check = await check_redirect(url, nxt)
+                    if check.blocked:
+                        status.state = "redirect_broken"
+                        status.error = f"blocked: redirect to a private/internal address: {hop.location[:120]}"
+                        break
+                    next_pin = check.pinned_ip
 
                 seen.add(nxt)
                 current = nxt
+                pin = next_pin
                 status.final_url = nxt
                 # RFC 9110: 303 turns the request into a GET; the others keep it.
                 if hop.status == 303:
@@ -242,12 +284,12 @@ class UrlStatusChecker:
         # Only worth a body fetch once we know the target answered as asked: a
         # 404's error page changes for reasons nobody wants to be alerted about.
         if options.checksum and status.ok and status.final_url:
-            await self._add_checksum(status, original_host)
+            await self._add_checksum(status, original_host, pin)
 
         status.elapsed_s = time.monotonic() - started
         return status
 
-    async def _add_checksum(self, status: UrlStatus, original_host: str) -> None:
+    async def _add_checksum(self, status: UrlStatus, original_host: str, pin: str | None = None) -> None:
         """Hash the body of the final response, up to the size cap."""
         import httpx
 
@@ -256,10 +298,10 @@ class UrlStatusChecker:
         digest = hashlib.sha256()
         size = 0
         limit = self.options.checksum_max_bytes
-        scoped = self._scoped_kwargs(status.final_url, original_host)
+        target_url, kwargs = self._request_target(status.final_url, original_host, pin)
 
         try:
-            async with client.stream("GET", status.final_url, **scoped) as response:
+            async with client.stream("GET", target_url, **kwargs) as response:
                 status.content_type = response.headers.get("content-type")
                 if response.status_code not in status.expected_statuses:
                     # The target changed answer between the walk and this fetch.
@@ -294,7 +336,7 @@ class UrlStatusChecker:
         status.content_checksum = digest.hexdigest()
         status.content_length = size
 
-    async def _request(self, method: str, url: str, original_host: str):
+    async def _request(self, method: str, url: str, original_host: str, pin: str | None = None):
         """One hop. Returns ``(response, method_used)``.
 
         A GET is streamed and abandoned once the headers land, so a status check
@@ -302,16 +344,16 @@ class UrlStatusChecker:
         """
         client = self._client
         assert client is not None
-        scoped = self._scoped_kwargs(url, original_host)
+        target_url, kwargs = self._request_target(url, original_host, pin)
 
         if method == "HEAD":
-            response = await client.head(url, **scoped)
+            response = await client.head(target_url, **kwargs)
             if self.options.method == "auto" and response.status_code in _HEAD_UNSUPPORTED:
-                return await self._stream_get(url, original_host), "GET"
+                return await self._stream_get(url, original_host, pin), "GET"
             return response, "HEAD"
-        return await self._stream_get(url, original_host), "GET"
+        return await self._stream_get(url, original_host, pin), "GET"
 
-    async def _stream_get(self, url: str, original_host: str):
+    async def _stream_get(self, url: str, original_host: str, pin: str | None = None):
         """A GET whose body is never read.
 
         The response is closed on the way out of the ``with``; only the status
@@ -319,8 +361,8 @@ class UrlStatusChecker:
         """
         client = self._client
         assert client is not None
-        scoped = self._scoped_kwargs(url, original_host)
-        async with client.stream("GET", url, **scoped) as response:
+        target_url, kwargs = self._request_target(url, original_host, pin)
+        async with client.stream("GET", target_url, **kwargs) as response:
             return response
 
 

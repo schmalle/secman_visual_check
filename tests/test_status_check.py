@@ -1,11 +1,13 @@
 """The HTTP status/redirect pre-check: the walk, the classification, the fallbacks."""
 
 import asyncio
+from unittest.mock import patch
 
 import httpx
 import pytest
 
 from secman_visual_check.capture import CaptureOptions
+from secman_visual_check.ssrf_guard import HostCheck
 from secman_visual_check.status import StatusCheckOptions, UrlStatusChecker
 
 
@@ -314,6 +316,76 @@ def test_transport_failure_becomes_unreachable_and_never_propagates():
     assert status.state == "unreachable"
     assert status.ok is False
     assert "ConnectError" in status.error
+
+
+def test_cross_host_redirect_connects_to_the_pinned_address_not_the_hostname():
+    """DNS-rebinding guard: the walk must connect to the exact address
+    ssrf_guard's check validated, not re-resolve the hostname a second time.
+    Since MockTransport never resolves DNS at all, this is the only way to
+    observe which address the request actually targeted."""
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"Location": "https://redirected.example/next"})
+        return httpx.Response(200)
+
+    with patch(
+        "secman_visual_check.status.check_redirect",
+        return_value=HostCheck(blocked=False, pinned_ip="203.0.113.7"),
+    ):
+        status = run_check(handler, checksum=False)
+
+    assert status.state == "redirect"
+    assert status.ok is True
+    # The reported chain still shows the real hostname...
+    assert status.final_url == "https://redirected.example/next"
+    # ...but the connection that was actually made targeted the pinned IP,
+    # with the real hostname preserved for the Host header and TLS SNI.
+    pinned_request = seen[1]
+    assert pinned_request.url.host == "203.0.113.7"
+    assert pinned_request.headers.get("host") == "redirected.example"
+    assert pinned_request.extensions.get("sni_hostname") == "redirected.example"
+
+
+def test_same_host_redirect_is_never_pinned():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.url.path == "/a":
+            return httpx.Response(302, headers={"Location": "/b"})
+        return httpx.Response(200)
+
+    status = run_check(handler, url="https://example.com/a", checksum=False)
+
+    assert status.state == "redirect"
+    second_request = seen[1]
+    assert second_request.url.host == "example.com"
+    assert second_request.extensions.get("sni_hostname") is None
+
+
+def test_checksum_fetch_of_a_pinned_redirect_target_also_uses_the_pin():
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"Location": "https://redirected.example/next"})
+        return httpx.Response(200, content=b"hello")
+
+    with patch(
+        "secman_visual_check.status.check_redirect",
+        return_value=HostCheck(blocked=False, pinned_ip="203.0.113.7"),
+    ):
+        status = run_check(handler)
+
+    assert status.content_checksum is not None
+    # HEAD (or the auto-GET fallback) hop plus the checksum GET both pinned.
+    pinned_requests = [r for r in seen if r.url.host == "203.0.113.7"]
+    assert len(pinned_requests) >= 2
+    assert all(r.headers.get("host") == "redirected.example" for r in pinned_requests)
 
 
 def test_head_falls_back_to_get_when_the_server_refuses_head():
