@@ -77,7 +77,7 @@ site.
 | flag | default | what it does |
 | --- | --- | --- |
 | `--no-status-check` | on | skip the check entirely |
-| `--allow-private-redirects` | off | allow a redirect to a private/loopback/link-local address on a different host than the target, and let `--basic-auth`/`-H` credentials follow a cross-host redirect. Also applies to the browser capture's navigation/iframe handling. |
+| `--allow-private-redirects` | off | allow a redirect to a private/loopback/link-local address on a different host than the target, and let `--basic-auth`/`-H` credentials follow a cross-host redirect. Also applies to the browser capture's navigation/iframe handling and to the `--respect-robots` robots.txt fetch. |
 | `--status-method {auto,head,get}` | `auto` | `auto` = HEAD with a GET fallback; the others pin the method |
 | `--status-timeout SECONDS` | `15.0` | per-request timeout |
 | `--status-max-redirects N` | `10` | hops to follow; `0` records the first response and stops |
