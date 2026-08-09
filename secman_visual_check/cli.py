@@ -257,6 +257,16 @@ def build_parser() -> argparse.ArgumentParser:
     browser.add_argument(
         "--browser-executable", metavar="PATH", help="path to a Chromium binary"
     )
+    browser.add_argument(
+        "--disable-browser-sandbox",
+        action="store_true",
+        help="launch Chromium with --no-sandbox, disabling its process sandbox. "
+        "Off by default: this tool navigates to arbitrary, often-external URLs, "
+        "and the sandbox is the primary containment boundary if a target "
+        "exploits a renderer bug. Only pass this when the deployment cannot run "
+        "a sandboxed Chromium (e.g. some containers running as root) and no "
+        "other isolation (container/VM) wraps the scan.",
+    )
 
     status = parser.add_argument_group(
         "status check",
@@ -814,6 +824,7 @@ def build_config(
         browser_channel=args.browser_channel,
         executable_path=args.browser_executable,
         block_private_redirects=not args.allow_private_redirects,
+        sandbox=not args.disable_browser_sandbox,
     )
 
     categories = load_categories(args.categories_file)

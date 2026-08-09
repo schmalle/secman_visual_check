@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
+
+from .ssrf_guard import is_unsafe_redirect
+
+#: Every other outbound fetch in this tool (status.py, capture.py) validates
+#: redirects against ssrf_guard before following them - a target's robots.txt
+#: response is just as attacker-controlled as its page content, so a 3xx here
+#: gets the same treatment instead of httpx's unrestricted follow_redirects.
+_MAX_REDIRECTS = 5
+_ALLOWED_SCHEMES = {"http", "https"}
 
 
 class RobotsCache:
@@ -41,11 +50,30 @@ class RobotsCache:
     async def _fetch(self, robots_url: str) -> RobotFileParser | None:
         import httpx
 
+        current = robots_url
+        seen = {current}
         try:
             async with httpx.AsyncClient(
-                timeout=self.timeout_s, follow_redirects=True
+                timeout=self.timeout_s, follow_redirects=False
             ) as client:
-                response = await client.get(robots_url)
+                for _ in range(_MAX_REDIRECTS + 1):
+                    response = await client.get(current)
+                    if not response.is_redirect:
+                        break
+                    location = response.headers.get("location")
+                    if not location:
+                        return None
+                    nxt = urljoin(current, location)
+                    if urlsplit(nxt).scheme not in _ALLOWED_SCHEMES:
+                        return None
+                    if nxt in seen:
+                        return None  # redirect loop
+                    if await is_unsafe_redirect(robots_url, nxt):
+                        return None  # fail open: treat as unfetchable, same as any other error
+                    seen.add(nxt)
+                    current = nxt
+                else:
+                    return None  # too many redirects
         except Exception:
             return None
 

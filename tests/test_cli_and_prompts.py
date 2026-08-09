@@ -89,6 +89,17 @@ def test_browser_options_are_wired_through(tmp_path):
     assert config.capture.ignore_https_errors is True
     assert config.capture.basic_auth == ("user", "pw")
     assert config.capture.extra_headers == {"X-Env": "staging"}
+    assert config.capture.sandbox is True
+
+
+def test_browser_sandbox_stays_on_unless_explicitly_disabled(tmp_path):
+    config = build_config(parse(["https://example.com", "-o", str(tmp_path)]))
+    assert config.capture.sandbox is True
+
+    config = build_config(
+        parse(["https://example.com", "-o", str(tmp_path), "--disable-browser-sandbox"])
+    )
+    assert config.capture.sandbox is False
 
 
 def test_parse_status_list_accepts_codes_and_wildcards():

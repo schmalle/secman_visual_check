@@ -131,6 +131,16 @@ class CaptureOptions:
     #: on by default, blocks navigation to such a host unless it matches the
     #: host originally requested. See ssrf_guard.py.
     block_private_redirects: bool = True
+    #: Chromium's own process sandbox, the primary containment boundary
+    #: between a compromised renderer and this host. This tool's whole job is
+    #: pointing headless Chromium at arbitrary, often-external, potentially
+    #: adversarial URLs, so a target that exploits a renderer bug gets
+    #: contained to the sandboxed process, not the host. On by default;
+    #: disable only when the deployment environment cannot run a sandboxed
+    #: Chromium (e.g. some containers running as root without the SUID
+    #: sandbox helper) and no stronger isolation (container/VM/gVisor) wraps
+    #: the scan.
+    sandbox: bool = True
 
 
 def screenshot_filename(url: str, index: int) -> str:
@@ -177,9 +187,12 @@ class BrowserCapturer:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._playwright = await async_playwright().start()
 
+        launch_args = ["--disable-dev-shm-usage"]
+        if not self.options.sandbox:
+            launch_args.append("--no-sandbox")
         launch_kwargs: dict[str, object] = {
             "headless": True,
-            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+            "args": launch_args,
         }
         if self.options.browser_channel:
             launch_kwargs["channel"] = self.options.browser_channel
