@@ -345,8 +345,10 @@ class FakePWBrowser:
 class FakePWChromium:
     def __init__(self, browser):
         self._browser = browser
+        self.launch_kwargs: dict[str, object] | None = None
 
     async def launch(self, **kwargs):
+        self.launch_kwargs = kwargs
         return self._browser
 
 
@@ -422,3 +424,53 @@ def test_aenter_skips_the_context_guard_when_disabled(tmp_path, monkeypatch):
     run(go())
 
     assert fake_context.routes == []
+
+
+def test_aenter_launches_with_the_chromium_sandbox_by_default(tmp_path, monkeypatch):
+    fake_context = FakePWContext()
+    fake_browser = FakePWBrowser(fake_context)
+    fake_playwright = FakePlaywright(fake_browser)
+
+    import secman_visual_check.capture as capture_module
+    import playwright.async_api as playwright_async_api
+
+    monkeypatch.setattr(
+        playwright_async_api,
+        "async_playwright",
+        lambda: FakePlaywrightContextManager(fake_playwright),
+    )
+
+    capturer = capture_module.BrowserCapturer(CaptureOptions(), tmp_path)
+
+    async def go():
+        async with capturer:
+            pass
+
+    run(go())
+
+    assert "--no-sandbox" not in fake_playwright.chromium.launch_kwargs["args"]
+
+
+def test_aenter_disables_the_chromium_sandbox_only_when_requested(tmp_path, monkeypatch):
+    fake_context = FakePWContext()
+    fake_browser = FakePWBrowser(fake_context)
+    fake_playwright = FakePlaywright(fake_browser)
+
+    import secman_visual_check.capture as capture_module
+    import playwright.async_api as playwright_async_api
+
+    monkeypatch.setattr(
+        playwright_async_api,
+        "async_playwright",
+        lambda: FakePlaywrightContextManager(fake_playwright),
+    )
+
+    capturer = capture_module.BrowserCapturer(CaptureOptions(sandbox=False), tmp_path)
+
+    async def go():
+        async with capturer:
+            pass
+
+    run(go())
+
+    assert "--no-sandbox" in fake_playwright.chromium.launch_kwargs["args"]
