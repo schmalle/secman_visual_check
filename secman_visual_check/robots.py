@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
+
+from .ssrf_guard import is_unsafe_redirect
+
+#: Same shape as status.py's walk: a robots.txt host is exactly as capable of
+#: redirecting the scanner at an internal address as any other target, so the
+#: hop count is bounded and every hop is checked, not just the first request.
+_MAX_REDIRECTS = 10
 
 
 class RobotsCache:
@@ -39,13 +46,39 @@ class RobotsCache:
         return parser
 
     async def _fetch(self, robots_url: str) -> RobotFileParser | None:
+        """GET ``robots_url``, walking redirects by hand.
+
+        Redirects are *not* auto-followed by the httpx client: a compromised
+        or malicious target could otherwise point ``robots.txt`` at
+        169.254.169.254 or another internal address and have this fetch
+        follow it unconditionally, exactly the SSRF shape ``ssrf_guard.py``
+        exists to close for the browser capture and the status check. Same
+        policy here: a cross-host redirect onto a private/loopback/link-local
+        address is refused; anything else is followed, up to
+        :data:`_MAX_REDIRECTS` hops.
+        """
         import httpx
 
+        current = robots_url
         try:
             async with httpx.AsyncClient(
-                timeout=self.timeout_s, follow_redirects=True
+                timeout=self.timeout_s, follow_redirects=False
             ) as client:
-                response = await client.get(robots_url)
+                for _ in range(_MAX_REDIRECTS + 1):
+                    response = await client.get(current)
+                    if response.status_code not in (301, 302, 303, 307, 308):
+                        break
+                    location = response.headers.get("location")
+                    if not location:
+                        return None
+                    nxt = urljoin(current, location)
+                    if urlsplit(nxt).scheme not in ("http", "https"):
+                        return None
+                    if await is_unsafe_redirect(robots_url, nxt):
+                        return None
+                    current = nxt
+                else:
+                    return None
         except Exception:
             return None
 
