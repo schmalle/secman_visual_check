@@ -562,6 +562,7 @@ def make_report_with_secret(secret: str = SECRET) -> ScanReport:
                 recommendation=f"stop echoing {secret}",
             )
         ],
+        raw_response=f'{{"summary": "the page said {secret}"}}',
     )
     status = UrlStatus(
         url="https://example.com/",
@@ -604,7 +605,9 @@ def test_redact_report_scrubs_every_target_influenced_text_field():
     assert SECRET not in result.analysis.findings[0].evidence
     assert SECRET not in result.analysis.findings[0].recommendation
     assert SECRET not in (result.error or "")
+    assert SECRET not in (result.analysis.raw_response or "")
     assert "<redacted>" in result.capture.title
+    assert "<redacted>" in result.analysis.raw_response
 
 
 def test_redact_report_leaves_structural_fields_alone():
@@ -637,6 +640,24 @@ def test_json_report_without_secrets_is_unaffected(tmp_path):
     text = path.read_text(encoding="utf-8")
 
     assert SECRET in text
+
+
+def test_json_report_with_include_raw_redacts_the_raw_model_response(tmp_path):
+    """Regression guard: ``Analysis.raw_response`` is exactly as
+    target-influenced as ``summary``/``findings`` — it is what those are
+    parsed *from* — but ``--include-raw`` writes it verbatim into the JSON
+    report. It must go through the same scrub as every other text field."""
+    path = write_json_report(
+        make_report_with_secret(),
+        tmp_path / "report.json",
+        include_raw=True,
+        secrets=[SECRET],
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    data = json.loads(text)
+    assert "<redacted>" in data["results"][0]["analysis"]["raw_response"]
 
 
 def test_html_report_redacts_a_reflected_secret(tmp_path):
