@@ -7,6 +7,7 @@ import pytest
 from secman_visual_check.capture import (
     BrowserCapturer,
     CaptureOptions,
+    _check_response_address,
     _make_context_guard_handler,
     _make_secure_route_handler,
     screenshot_filename,
@@ -422,3 +423,167 @@ def test_aenter_skips_the_context_guard_when_disabled(tmp_path, monkeypatch):
     run(go())
 
     assert fake_context.routes == []
+
+
+# --------------------------------------------------------------------------- #
+# _check_response_address — the post-connect DNS-rebinding check. Chromium
+# resolves and connects on its own once route.continue_() lets a request
+# through, so a rebinding nameserver can still answer differently than it
+# answered the pre-connect guards above; this is what catches that after the
+# fact (see PageCapture.blocked_ssrf / worth_analyzing).
+# --------------------------------------------------------------------------- #
+
+
+class FakeResponse:
+    def __init__(self, url, status=200, server_addr=None, raise_on_server_addr=False):
+        self.url = url
+        self.status = status
+        self._server_addr = server_addr
+        self._raise = raise_on_server_addr
+
+    async def server_addr(self):
+        if self._raise:
+            raise RuntimeError("connection already closed")
+        return self._server_addr
+
+
+def test_response_address_check_flags_a_cross_host_private_connection():
+    response = FakeResponse(
+        "https://third-party.example/beacon", server_addr={"ipAddress": "127.0.0.1", "port": 80}
+    )
+
+    blocked_host = run(_check_response_address(response, "https://example.com/"))
+
+    assert blocked_host == "third-party.example"
+
+
+def test_response_address_check_allows_a_cross_host_public_connection():
+    response = FakeResponse(
+        "https://third-party.example/beacon", server_addr={"ipAddress": "93.184.216.34", "port": 443}
+    )
+
+    assert run(_check_response_address(response, "https://example.com/")) is None
+
+
+def test_response_address_check_has_no_same_host_exemption_bypass_but_skips_same_host():
+    # Same host as the operator's own target is never flagged, no matter what
+    # address it connected to — matches every other guard's same-host rule.
+    response = FakeResponse("https://example.com/", server_addr={"ipAddress": "127.0.0.1", "port": 443})
+
+    assert run(_check_response_address(response, "https://example.com/")) is None
+
+
+def test_response_address_check_tolerates_a_missing_server_addr():
+    # E.g. a response served from cache — Playwright returns None.
+    response = FakeResponse("https://third-party.example/beacon", server_addr=None)
+
+    assert run(_check_response_address(response, "https://example.com/")) is None
+
+
+def test_response_address_check_fails_open_on_a_lookup_error():
+    response = FakeResponse("https://third-party.example/beacon", raise_on_server_addr=True)
+
+    assert run(_check_response_address(response, "https://example.com/")) is None
+
+
+# --------------------------------------------------------------------------- #
+# Wiring: BrowserCapturer.capture() must collect the post-connect checks and
+# flag the capture, excluding it from AI analysis, without a real browser.
+# --------------------------------------------------------------------------- #
+
+
+class FakeCapturePage:
+    """Just enough of Playwright's Page for BrowserCapturer.capture()."""
+
+    def __init__(self, goto_response, other_responses=()):
+        self._handlers: dict[str, list] = {}
+        self._goto_response = goto_response
+        self._other_responses = other_responses
+        self.url = goto_response.url
+
+    def on(self, event, handler):
+        self._handlers.setdefault(event, []).append(handler)
+
+    async def route(self, pattern, handler):
+        pass
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        for handler in self._handlers.get("response", []):
+            handler(self._goto_response)
+        for response in self._other_responses:
+            for handler in self._handlers.get("response", []):
+                handler(response)
+        return self._goto_response
+
+    async def wait_for_timeout(self, ms):
+        return None
+
+    async def title(self):
+        return "A title"
+
+    async def inner_text(self, selector):
+        return "body text"
+
+    async def evaluate(self, script):
+        return 100
+
+    async def screenshot(self, **kwargs):
+        return None
+
+    async def close(self):
+        return None
+
+
+class FakeCaptureContext:
+    def __init__(self, page):
+        self._page = page
+
+    async def new_page(self):
+        return self._page
+
+
+def _make_capturer_with_page(tmp_path, page, **option_overrides) -> BrowserCapturer:
+    capturer = BrowserCapturer(CaptureOptions(**option_overrides), tmp_path)
+    capturer._context = FakeCaptureContext(page)
+    capturer._screenshot_lock = asyncio.Lock()
+    return capturer
+
+
+def test_capture_flags_blocked_ssrf_from_a_subresource_and_excludes_it_from_analysis(tmp_path):
+    main = FakeResponse("https://example.com/", server_addr={"ipAddress": "93.184.216.34", "port": 443})
+    beacon = FakeResponse(
+        "https://third-party.example/beacon", server_addr={"ipAddress": "169.254.169.254", "port": 80}
+    )
+    page = FakeCapturePage(goto_response=main, other_responses=[beacon])
+    capturer = _make_capturer_with_page(tmp_path, page)
+
+    capture = run(capturer.capture("https://example.com/"))
+
+    assert capture.blocked_ssrf is True
+    assert capture.worth_analyzing is False
+    assert "third-party.example" in (capture.load_error or "")
+
+
+def test_capture_leaves_blocked_ssrf_false_when_every_response_is_safe(tmp_path):
+    main = FakeResponse("https://example.com/", server_addr={"ipAddress": "93.184.216.34", "port": 443})
+    page = FakeCapturePage(goto_response=main)
+    capturer = _make_capturer_with_page(tmp_path, page)
+
+    capture = run(capturer.capture("https://example.com/"))
+
+    assert capture.blocked_ssrf is False
+    assert capture.worth_analyzing is True
+    assert capture.load_error is None
+
+
+def test_capture_does_not_check_response_addresses_when_disabled(tmp_path):
+    main = FakeResponse("https://example.com/", server_addr={"ipAddress": "93.184.216.34", "port": 443})
+    beacon = FakeResponse(
+        "https://third-party.example/beacon", server_addr={"ipAddress": "127.0.0.1", "port": 80}
+    )
+    page = FakeCapturePage(goto_response=main, other_responses=[beacon])
+    capturer = _make_capturer_with_page(tmp_path, page, block_private_redirects=False)
+
+    capture = run(capturer.capture("https://example.com/"))
+
+    assert capture.blocked_ssrf is False

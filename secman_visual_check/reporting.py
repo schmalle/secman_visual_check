@@ -134,6 +134,11 @@ def _redact_analysis(analysis: Analysis | None, secrets: Sequence[str]) -> Analy
         page_type=redact(analysis.page_type, secrets),
         error=_redact_or_none(analysis.error, secrets),
         findings=[_redact_finding(f, secrets) for f in analysis.findings],
+        # The model's full, unparsed completion text — summary/findings are parsed
+        # out of exactly this, so anything reflected into those is reflected here
+        # too, and --include-raw writes it straight into report.json otherwise
+        # unredacted.
+        raw_response=_redact_or_none(analysis.raw_response, secrets),
     )
 
 

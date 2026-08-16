@@ -160,6 +160,48 @@ def test_redirect_to_loopback_on_a_different_host_is_blocked():
     assert "blocked" in status.error
 
 
+def test_redirect_to_a_public_host_pins_the_resolved_address(monkeypatch):
+    """DNS-rebinding regression guard: the connection for a cross-host
+    redirect must use the exact address ssrf_guard.check_redirect validated,
+    not re-resolve the hostname — otherwise a nameserver that answers this
+    lookup with a public IP and the connection's own lookup moments later
+    with a private one defeats the guard entirely."""
+    import secman_visual_check.ssrf_guard as ssrf_guard
+
+    class FakeLoop:
+        async def getaddrinfo(self, host, port):
+            return [(None, None, None, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(ssrf_guard.asyncio, "get_event_loop", lambda: FakeLoop())
+
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        if str(request.url) == "https://example.com/":
+            return httpx.Response(302, headers={"Location": "https://other-public-site.example/"})
+        # The second hop and the checksum GET that follows it: httpx must
+        # have connected to the pinned IP, never re-resolved
+        # "other-public-site.example" itself.
+        return httpx.Response(200, content=b"hello world")
+
+    status = run_check(handler)
+
+    assert status.state == "redirect"
+    assert status.ok is True
+    assert status.final_url == "https://other-public-site.example/"
+    assert status.content_checksum is not None
+    # hop1 (unpinned, the operator's own target) + hop2 + the checksum GET
+    # (both of the latter pinned to the resolved address, since the checksum
+    # fetch is a second, independent request against status.final_url that
+    # must reuse the walk's pin rather than re-resolving and reopening the
+    # DNS-rebinding gap this whole fix closes).
+    assert len(seen) == 3
+    pinned_requests = seen[1:]
+    assert all(r.url.host == "93.184.216.34" for r in pinned_requests)
+    assert all(r.headers["host"] == "other-public-site.example" for r in pinned_requests)
+
+
 def test_redirect_to_a_private_address_can_be_allowed_explicitly():
     # --allow-private-redirects: an operator scanning their own internal
     # infrastructure via a known redirector must be able to opt back in.

@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlsplit
 
 from .capture import CaptureOptions
 from .models import RedirectHop, UrlStatus, utcnow
-from .ssrf_guard import is_unsafe_redirect
+from .ssrf_guard import check_redirect
 
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_MAX_REDIRECTS = 10
@@ -126,6 +126,42 @@ class UrlStatusChecker:
             kwargs["auth"] = self.options.basic_auth
         return kwargs
 
+    def _pin_target(self, url: str, pinned_ip: str | None) -> tuple[object, dict]:
+        """If ``pinned_ip`` is set (see ``ssrf_guard.check_redirect``),
+        rewrite the connection target to that literal address instead of
+        handing httpx the hostname — letting httpx re-resolve it would
+        reopen the DNS-rebinding gap ``check_redirect`` closes: an
+        attacker-run nameserver could answer this connection's lookup
+        differently than it answered the guard's. The ``Host`` header and
+        TLS SNI still carry the original hostname (httpx/httpcore's
+        ``sni_hostname`` extension), so virtual hosting and certificate
+        validation are unaffected.
+        """
+        if pinned_ip is None:
+            return url, {}
+        import httpx
+
+        parsed = httpx.URL(url)
+        original_host = parsed.host
+        return parsed.copy_with(host=pinned_ip), {
+            "headers": {"Host": original_host},
+            "extensions": {"sni_hostname": original_host},
+        }
+
+    def _connect_kwargs(self, url: str, original_host: str, pinned_ip: str | None) -> tuple[object, dict]:
+        """Merge :meth:`_scoped_kwargs` (credential scoping) with
+        :meth:`_pin_target` (DNS-rebinding pin), header dicts included."""
+        target, pin = self._pin_target(url, pinned_ip)
+        scoped = self._scoped_kwargs(url, original_host)
+        if not pin:
+            return target, scoped
+        merged = dict(scoped)
+        headers = dict(pin["headers"])
+        headers.update(scoped.get("headers") or {})
+        merged["headers"] = headers
+        merged["extensions"] = pin["extensions"]
+        return target, merged
+
     async def __aexit__(self, *exc_info: object) -> None:
         await self.aclose()
 
@@ -157,6 +193,11 @@ class UrlStatusChecker:
         )
         started = time.monotonic()
         current = url
+        # Set only when the current hop's host was DNS-validated by
+        # check_redirect (never for `url` itself, the operator's own choice,
+        # and never for a same-host hop). See _connect_kwargs/_pin_target.
+        current_pinned_ip: str | None = None
+        final_pinned_ip: str | None = None
         method = "GET" if options.method == "get" else "HEAD"
         seen = {url}
         original_host = (urlsplit(url).hostname or "").lower()
@@ -172,7 +213,9 @@ class UrlStatusChecker:
         try:
             while True:
                 hop_started = time.monotonic()
-                response, used_method = await self._request(method, current, original_host)
+                response, used_method = await self._request(
+                    method, current, original_host, current_pinned_ip
+                )
                 hop = RedirectHop(
                     url=current,
                     status=response.status_code,
@@ -210,13 +253,19 @@ class UrlStatusChecker:
                     status.state = "redirect_broken"
                     status.error = f"redirect loop at {nxt}"
                     break
-                if options.block_private_redirects and await is_unsafe_redirect(url, nxt):
-                    status.state = "redirect_broken"
-                    status.error = f"blocked: redirect to a private/internal address: {hop.location[:120]}"
-                    break
+                next_pinned_ip: str | None = None
+                if options.block_private_redirects:
+                    redirect_check = await check_redirect(url, nxt)
+                    if redirect_check.unsafe:
+                        status.state = "redirect_broken"
+                        status.error = f"blocked: redirect to a private/internal address: {hop.location[:120]}"
+                        break
+                    next_pinned_ip = redirect_check.pinned_ip
 
                 seen.add(nxt)
                 current = nxt
+                current_pinned_ip = next_pinned_ip
+                final_pinned_ip = next_pinned_ip
                 status.final_url = nxt
                 # RFC 9110: 303 turns the request into a GET; the others keep it.
                 if hop.status == 303:
@@ -242,13 +291,21 @@ class UrlStatusChecker:
         # Only worth a body fetch once we know the target answered as asked: a
         # 404's error page changes for reasons nobody wants to be alerted about.
         if options.checksum and status.ok and status.final_url:
-            await self._add_checksum(status, original_host)
+            await self._add_checksum(status, original_host, final_pinned_ip)
 
         status.elapsed_s = time.monotonic() - started
         return status
 
-    async def _add_checksum(self, status: UrlStatus, original_host: str) -> None:
-        """Hash the body of the final response, up to the size cap."""
+    async def _add_checksum(
+        self, status: UrlStatus, original_host: str, pinned_ip: str | None = None
+    ) -> None:
+        """Hash the body of the final response, up to the size cap.
+
+        ``pinned_ip`` is the address the walk already validated
+        ``status.final_url`` against (see ``ssrf_guard.check_redirect``) —
+        reused here rather than re-resolving, for the same DNS-rebinding
+        reason ``_request``/``_stream_get`` pin it.
+        """
         import httpx
 
         client = self._client
@@ -256,10 +313,10 @@ class UrlStatusChecker:
         digest = hashlib.sha256()
         size = 0
         limit = self.options.checksum_max_bytes
-        scoped = self._scoped_kwargs(status.final_url, original_host)
+        target, kwargs = self._connect_kwargs(status.final_url, original_host, pinned_ip)
 
         try:
-            async with client.stream("GET", status.final_url, **scoped) as response:
+            async with client.stream("GET", target, **kwargs) as response:
                 status.content_type = response.headers.get("content-type")
                 if response.status_code not in status.expected_statuses:
                     # The target changed answer between the walk and this fetch.
@@ -294,7 +351,9 @@ class UrlStatusChecker:
         status.content_checksum = digest.hexdigest()
         status.content_length = size
 
-    async def _request(self, method: str, url: str, original_host: str):
+    async def _request(
+        self, method: str, url: str, original_host: str, pinned_ip: str | None = None
+    ):
         """One hop. Returns ``(response, method_used)``.
 
         A GET is streamed and abandoned once the headers land, so a status check
@@ -302,16 +361,16 @@ class UrlStatusChecker:
         """
         client = self._client
         assert client is not None
-        scoped = self._scoped_kwargs(url, original_host)
+        target, kwargs = self._connect_kwargs(url, original_host, pinned_ip)
 
         if method == "HEAD":
-            response = await client.head(url, **scoped)
+            response = await client.head(target, **kwargs)
             if self.options.method == "auto" and response.status_code in _HEAD_UNSUPPORTED:
-                return await self._stream_get(url, original_host), "GET"
+                return await self._stream_get(url, original_host, pinned_ip), "GET"
             return response, "HEAD"
-        return await self._stream_get(url, original_host), "GET"
+        return await self._stream_get(url, original_host, pinned_ip), "GET"
 
-    async def _stream_get(self, url: str, original_host: str):
+    async def _stream_get(self, url: str, original_host: str, pinned_ip: str | None = None):
         """A GET whose body is never read.
 
         The response is closed on the way out of the ``with``; only the status
@@ -319,8 +378,8 @@ class UrlStatusChecker:
         """
         client = self._client
         assert client is not None
-        scoped = self._scoped_kwargs(url, original_host)
-        async with client.stream("GET", url, **scoped) as response:
+        target, kwargs = self._connect_kwargs(url, original_host, pinned_ip)
+        async with client.stream("GET", target, **kwargs) as response:
             return response
 
 
