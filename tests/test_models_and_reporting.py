@@ -553,6 +553,7 @@ def make_report_with_secret(secret: str = SECRET) -> ScanReport:
         risk_level=Severity.LOW,
         summary=f"The page reflected the credential {secret} back in its body.",
         page_type=f"error page mentioning {secret}",
+        raw_response=f'{{"summary": "reflected {secret} in the raw completion text"}}',
         findings=[
             Finding(
                 category=f"leaked_{secret}",
@@ -599,6 +600,7 @@ def test_redact_report_scrubs_every_target_influenced_text_field():
     assert SECRET not in result.status_check.error
     assert SECRET not in result.analysis.summary
     assert SECRET not in result.analysis.page_type
+    assert SECRET not in result.analysis.raw_response
     assert SECRET not in result.analysis.findings[0].category
     assert SECRET not in result.analysis.findings[0].title
     assert SECRET not in result.analysis.findings[0].evidence
@@ -623,6 +625,20 @@ def test_redact_report_leaves_structural_fields_alone():
 def test_json_report_redacts_a_reflected_secret(tmp_path):
     path = write_json_report(
         make_report_with_secret(), tmp_path / "report.json", secrets=[SECRET]
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    assert "<redacted>" in text
+
+
+def test_json_report_with_include_raw_redacts_the_raw_response(tmp_path):
+    """Regression guard: raw_response is the model's full, unparsed completion
+    text — everything summary/findings are parsed out of. Before this fix it
+    was the one Analysis field _redact_analysis skipped, so --include-raw
+    could write an already-scrubbed secret back out in plaintext."""
+    path = write_json_report(
+        make_report_with_secret(), tmp_path / "report.json", include_raw=True, secrets=[SECRET]
     )
     text = path.read_text(encoding="utf-8")
 

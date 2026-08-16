@@ -106,6 +106,15 @@ class PageCapture:
     duration_s: float = 0.0
     viewport: tuple[int, int] = (0, 0)
     page_height: int | None = None
+    #: True when a response this capture received actually connected to a
+    #: private/internal address on a different host than `url` — detected
+    #: after the fact via Playwright's `response.server_addr()`, since
+    #: Chromium has no pre-connect IP-pinning hook the way status.py's httpx
+    #: client does (see capture.py's `_check_response_address` and
+    #: ssrf_guard.py). The screenshot/text are still kept as evidence for the
+    #: operator, but `worth_analyzing` excludes them from the AI call and
+    #: reporting.py flags them, so neither leaks the fetched content further.
+    blocked_ssrf: bool = False
 
     @property
     def ok(self) -> bool:
@@ -119,7 +128,7 @@ class PageCapture:
     @property
     def worth_analyzing(self) -> bool:
         """Only spend model tokens on screenshots that show real page content."""
-        return self.ok and not self.is_browser_error_page
+        return self.ok and not self.is_browser_error_page and not self.blocked_ssrf
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +143,7 @@ class PageCapture:
             "duration_s": round(self.duration_s, 3),
             "viewport": list(self.viewport),
             "page_height": self.page_height,
+            "blocked_ssrf": self.blocked_ssrf,
         }
 
 

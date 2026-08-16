@@ -13,9 +13,47 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .models import PageCapture
-from .ssrf_guard import is_unsafe_destination, is_unsafe_redirect, same_host
+from .ssrf_guard import is_blocked_address, is_unsafe_destination, is_unsafe_redirect, same_host
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+async def _check_response_address(response, original_url: str) -> str | None:
+    """The post-connect twin of the route handlers above.
+
+    ``route.continue_()`` lets Chromium resolve and connect on its own —
+    there is no hook to pin that connection to an address a lookup already
+    validated, the way ``status.py``'s httpx client can (see
+    ``ssrf_guard.check_redirect``). A DNS-rebinding nameserver can therefore
+    still answer the pre-connect guard's lookup safely and the connection's
+    own lookup moments later with a private address. This runs *after* the
+    response has already landed and reads the address Chromium actually
+    connected to (``response.server_addr()``), too late to stop the
+    request but in time to keep its content out of analysis and reports —
+    see ``PageCapture.blocked_ssrf``/``worth_analyzing``.
+
+    Returns the blocked hostname, or ``None`` if the response is fine (or
+    the check itself failed — a closed page, a response with no server
+    address such as one served from cache — in which case it is not treated
+    as blocked, matching every other guard's fail-open-on-lookup-failure
+    stance here).
+    """
+    try:
+        request_url = response.url
+    except Exception:
+        return None
+    if same_host(original_url, request_url):
+        return None
+    try:
+        addr = await response.server_addr()
+    except Exception:
+        return None
+    if not addr:
+        return None
+    ip = addr.get("ipAddress") if isinstance(addr, dict) else None
+    if ip and is_blocked_address(ip):
+        return (urlparse(request_url).hostname or request_url).lower()
+    return None
 
 
 def _make_secure_route_handler(
@@ -278,6 +316,19 @@ class BrowserCapturer:
         )
         page.on("pageerror", lambda err: console_errors.append(f"pageerror: {err}"[:300]))
 
+        # Post-connect SSRF check (see _check_response_address): scheduled as a
+        # task per response rather than awaited inline in the handler, since
+        # Page's "response" event is a plain sync callback. Collected and
+        # awaited once, after the page has settled, below.
+        response_checks: list[asyncio.Task] = []
+        if self.options.block_private_redirects:
+            page.on(
+                "response",
+                lambda response: response_checks.append(
+                    asyncio.ensure_future(_check_response_address(response, url))
+                ),
+            )
+
         if self.options.block_private_redirects or self.options.extra_headers or self.options.basic_auth:
             await page.route(
                 "**/*",
@@ -304,6 +355,20 @@ class BrowserCapturer:
 
             if options.settle_ms > 0:
                 await page.wait_for_timeout(options.settle_ms)
+
+            for check in response_checks:
+                try:
+                    blocked_host = await check
+                except Exception:
+                    continue
+                if blocked_host:
+                    capture.blocked_ssrf = True
+                    if capture.load_error is None:
+                        capture.load_error = (
+                            f"blocked: a response connected to a private/internal "
+                            f"address ({blocked_host})"
+                        )
+                    break
 
             capture.final_url = page.url
             capture.title = await _safe(page.title)

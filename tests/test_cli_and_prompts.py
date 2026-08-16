@@ -197,6 +197,32 @@ def test_progress_hook_without_a_status_check_is_unchanged(capsys):
     assert capsys.readouterr().err.strip() == "[1/1] https://example.com/ -> info"
 
 
+def test_progress_hook_redacts_a_reflected_secret(capsys):
+    # Regression guard: this is the one writer that runs live, before the
+    # final reports (and their own redaction) exist — a resolved credential
+    # reflected into result.error/load_error must not reach stderr in the
+    # clear while the scan is still running.
+    secret = "s3cretPassw0rd"
+    hook = _progress_hook(quiet=False, secrets=[secret])
+    errored = ScanResult(url="https://example.com/", error=f"failed with {secret}")
+    load_failed = ScanResult(
+        url="https://dead.example/",
+        capture=PageCapture(
+            url="https://dead.example/",
+            final_url="https://dead.example/",
+            status=0,
+            load_error=f"401 for basic auth {secret}",
+        ),
+    )
+
+    hook(errored, 1, 2)
+    hook(load_failed, 2, 2)
+    err = capsys.readouterr().err
+
+    assert secret not in err
+    assert "<redacted>" in err
+
+
 def test_secman_status_flags_reach_the_options():
     options = build_secman_options(
         parse(

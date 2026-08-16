@@ -1058,16 +1058,26 @@ def _run_secman_upload(
     return EXIT_OK
 
 
-def _progress_hook(quiet: bool):
+def _progress_hook(quiet: bool, secrets: Sequence[str] = ()):
+    """Per-target progress line, printed live as the scan runs.
+
+    Unlike every other writer, this one runs *before* the final reports (and
+    their own redaction) exist, straight to stderr — a resolved secret
+    reflected into `result.error`/`load_error` (e.g. a `--basic-auth pass://`
+    credential a backend echoed back) would otherwise reach a terminal or CI
+    log unredacted before the scan even finishes. Route it through the same
+    `redact()` every other writer uses.
+    """
+
     def hook(result: ScanResult, done: int, total: int) -> None:
         if quiet:
             return
         if result.skipped_reason:
             state = f"skipped ({result.skipped_reason})"
         elif result.error:
-            state = f"error: {result.error}"
+            state = f"error: {redact(result.error, secrets)}"
         elif result.capture and result.capture.load_error:
-            state = f"load failed: {result.capture.load_error}"
+            state = f"load failed: {redact(result.capture.load_error, secrets)}"
         else:
             state = result.max_severity.value
         prefix = f"{result.status_check.label} | " if result.status_check else ""
@@ -1223,7 +1233,7 @@ def main(argv: list[str] | None = None) -> int:
             run_scan(
                 targets,
                 config,
-                progress=_progress_hook(args.quiet),
+                progress=_progress_hook(args.quiet, secrets=resolver.values),
                 tool_version=__version__,
             )
         )
