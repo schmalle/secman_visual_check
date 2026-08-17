@@ -795,6 +795,13 @@ target was skipped by `robots.txt`.
   model actually saw.
 - Screenshots of exposed pages contain the exposed data. Treat the output
   directory as sensitive.
+- The status check (`status.py`) pins every connection to a resolved,
+  blocklist-validated IP address, closing DNS-rebinding TOCTOU races against
+  the SSRF guard. The browser capture path (`capture.py`) cannot — Playwright
+  gives no hook to pin the IP Chromium connects to — so it only re-checks
+  immediately before each request is allowed through, which shrinks but does
+  not close that race. See [docs/STATUS_CHECK.md](docs/STATUS_CHECK.md)
+  §DNS-rebinding protection.
 
 ## Tests
 

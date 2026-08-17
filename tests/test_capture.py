@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+import secman_visual_check.capture as capture_module
 from secman_visual_check.capture import (
     BrowserCapturer,
     CaptureOptions,
@@ -294,6 +295,135 @@ def test_context_guard_never_attaches_credentials():
 
     assert route.continued_with == {}
     assert "authorization" not in (route.continued_with or {})
+
+
+def _patch(module, name, fake):
+    """Swap ``module.name`` for ``fake`` and return the original for restore."""
+    original = getattr(module, name)
+    setattr(module, name, fake)
+    return original
+
+
+# --------------------------------------------------------------------------- #
+# DNS-rebinding mitigation — capture.py has no IP-pinning hook (Playwright
+# gives none for route interception), so the best available mitigation is
+# re-running the guard as the last statement before route.continue_()/
+# route.fetch(), shrinking rather than closing the race window. See the
+# comment in _make_secure_route_handler/_make_context_guard_handler and the
+# residual-risk note in docs/STATUS_CHECK.md. These tests prove the re-check
+# actually happens (the guard is consulted twice, and a flip on the second
+# call still aborts) — they do not and cannot prove the race is closed, only
+# that the mitigation this change adds is real.
+# --------------------------------------------------------------------------- #
+
+
+def test_secure_route_handler_rechecks_immediately_before_continuing():
+    calls = []
+
+    async def counting(original_url, url):
+        calls.append(url)
+        return False  # safe both times
+
+    original = _patch(capture_module, "is_unsafe_redirect", counting)
+    try:
+        handler = _make_secure_route_handler(
+            "https://example.com/", None, None, block_private_redirects=True
+        )
+        route = FakeRoute(FakeRequest("https://example.com/next"))
+        run(handler(route))
+    finally:
+        capture_module.is_unsafe_redirect = original
+
+    assert route.aborted is False
+    assert calls == ["https://example.com/next", "https://example.com/next"]
+
+
+def test_secure_route_handler_aborts_when_the_second_check_flips_to_unsafe():
+    """Simulates the DNS-rebinding window this mitigation shrinks: the first
+    check (which decides whether to build credentialed headers at all) sees
+    a safe answer; a short-TTL record flips before the second, last-moment
+    check, which must still catch it and abort."""
+    calls = []
+
+    async def flipping(original_url, url):
+        calls.append(url)
+        return len(calls) == 2  # safe on the 1st check, unsafe on the 2nd
+
+    original = _patch(capture_module, "is_unsafe_redirect", flipping)
+    try:
+        handler = _make_secure_route_handler(
+            "https://example.com/", None, None, block_private_redirects=True
+        )
+        route = FakeRoute(FakeRequest("https://example.com/next"))
+        run(handler(route))
+    finally:
+        capture_module.is_unsafe_redirect = original
+
+    assert route.aborted is True
+    assert route.continued_with is None
+    assert len(calls) == 2
+
+
+def test_secure_route_handler_does_not_recheck_when_disabled():
+    calls = []
+
+    async def counting(original_url, url):
+        calls.append(url)
+        return True
+
+    original = _patch(capture_module, "is_unsafe_redirect", counting)
+    try:
+        handler = _make_secure_route_handler(
+            "https://example.com/", None, None, block_private_redirects=False
+        )
+        route = FakeRoute(FakeRequest("https://example.com/next"))
+        run(handler(route))
+    finally:
+        capture_module.is_unsafe_redirect = original
+
+    assert route.aborted is False
+    assert calls == []
+
+
+def test_context_guard_rechecks_immediately_before_continuing():
+    calls = []
+
+    async def counting(url):
+        calls.append(url)
+        return False
+
+    original = _patch(capture_module, "is_unsafe_destination", counting)
+    try:
+        handler = _make_context_guard_handler(block_private_redirects=True)
+        route = FakeRoute(FakeRequest("https://other-public-site.example/"))
+        run(handler(route))
+    finally:
+        capture_module.is_unsafe_destination = original
+
+    assert route.aborted is False
+    assert calls == [
+        "https://other-public-site.example/",
+        "https://other-public-site.example/",
+    ]
+
+
+def test_context_guard_aborts_when_the_second_check_flips_to_unsafe():
+    calls = []
+
+    async def flipping(url):
+        calls.append(url)
+        return len(calls) == 2
+
+    original = _patch(capture_module, "is_unsafe_destination", flipping)
+    try:
+        handler = _make_context_guard_handler(block_private_redirects=True)
+        route = FakeRoute(FakeRequest("https://other-public-site.example/"))
+        run(handler(route))
+    finally:
+        capture_module.is_unsafe_destination = original
+
+    assert route.aborted is True
+    assert len(calls) == 2
 
 
 def test_context_guard_respects_the_disable_flag():

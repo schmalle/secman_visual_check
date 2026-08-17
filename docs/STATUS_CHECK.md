@@ -56,6 +56,45 @@ internal infrastructure or cloud metadata endpoints (e.g. `169.254.169.254`)
 and collect whatever credentials were configured for a completely different
 site.
 
+## DNS-rebinding protection
+
+The SSRF check above (`ssrf_guard.is_unsafe_redirect`) resolves a hop's
+hostname purely to decide allow/block. On its own, that is a
+[TOCTOU](https://en.wikipedia.org/wiki/Time-of-check_to_time-of-use) race: an
+attacker controlling a domain with a short or zero DNS TTL can answer that
+lookup with a public IP, then answer the connection's *own*, separate lookup
+moments later with `169.254.169.254` or `127.0.0.1` — the decision and the
+connection never see the same address, and the guard is defeated entirely.
+
+**This module (`status.py`) closes that race with real IP pinning.** Every
+hop — the initial request and every redirect the walk follows, plus the body
+fetch a checksum performs — resolves its target host exactly once via
+`ssrf_guard.resolve_pinned_address`, validates *that* result against the
+blocklist, and hands the validated address itself to `httpx` as the
+connection target (with the original hostname preserved for the `Host`
+header and TLS SNI/certificate-hostname validation, via httpx's
+`sni_hostname` request extension). There is no second, independent
+resolution between "this looked safe" and "this is what we connected to", so
+a rebinding record has nothing to exploit. Same-host hops and the operator's
+own initial target are still pinned (so the connection is deterministic) but
+never *validated* — that mirrors the existing same-host exemption above, and
+is unrelated to the rebinding fix.
+
+**The browser capture path (`capture.py`) does not get this.** Playwright's
+route interception (`page.route()` / `context.route()`) gives no hook to
+choose the IP Chromium itself connects to — only to allow or abort a request
+before Chromium resolves and connects on its own. The best available
+mitigation there is re-running the same advisory check as the very last
+statement before `route.continue_()`/`route.fetch()` runs, shrinking the
+window a rebinding record has to flip in — it does **not** close the race.
+This is a known, accepted residual limitation of the browser-driven capture
+path, not an oversight: full protection would mean routing Chromium's
+traffic through a forward proxy this tool controls, which pins each
+navigation's DNS resolution once and reuses it for every request the page
+issues — tracked as follow-up work, not implemented here. Do not read the
+per-request guard in `capture.py` as equivalent to the pinning in
+`status.py`; it isn't.
+
 ## States
 
 | state | meaning | `ok` |

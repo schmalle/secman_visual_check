@@ -56,6 +56,7 @@ def _make_secure_route_handler(
             await route.abort()
             return
 
+        headers = None
         if (extra_headers or basic_auth) and same_host(original_url, request.url):
             headers = dict(await request.all_headers())
             if extra_headers:
@@ -64,10 +65,28 @@ def _make_secure_route_handler(
                 username, password = basic_auth
                 token = base64.b64encode(f"{username}:{password}".encode()).decode()
                 headers["authorization"] = f"Basic {token}"
-            await route.continue_(headers=headers)
+
+        # DNS-rebinding note (residual, best-effort — see ssrf_guard.py's
+        # module docstring): the check above and Chromium's own connection
+        # are still two independent resolutions, same as any TOCTOU race —
+        # Playwright's route interception gives no hook to pin the IP
+        # Chromium itself connects to (unlike status.py's httpx-based probe,
+        # which pins for real; see resolve_pinned_address there). Re-running
+        # the check here, as literally the last statement before
+        # route.continue_() runs, does not close that race — only a
+        # DNS-pinning forward proxy in front of Chromium's traffic could —
+        # but it does shrink the window a short-TTL attacker record has to
+        # answer differently between "we decided this was safe" and
+        # "Chromium connects", down to whatever this second lookup itself
+        # costs. Tracked as follow-up work; not implemented here.
+        if block_private_redirects and await is_unsafe_redirect(original_url, request.url):
+            await route.abort()
             return
 
-        await route.continue_()
+        if headers is not None:
+            await route.continue_(headers=headers)
+        else:
+            await route.continue_()
 
     return handler
 
@@ -100,6 +119,12 @@ def _make_context_guard_handler(block_private_redirects: bool):
 
     async def handler(route):
         request = route.request
+        if block_private_redirects and await is_unsafe_destination(request.url):
+            await route.abort()
+            return
+        # Re-checked immediately before continue_() for the same reason, and
+        # with the same residual DNS-rebinding limitation, as the per-page
+        # handler above (_make_secure_route_handler) — see that comment.
         if block_private_redirects and await is_unsafe_destination(request.url):
             await route.abort()
             return

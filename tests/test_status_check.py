@@ -5,6 +5,7 @@ import asyncio
 import httpx
 import pytest
 
+import secman_visual_check.ssrf_guard as ssrf_guard
 from secman_visual_check.capture import CaptureOptions
 from secman_visual_check.status import StatusCheckOptions, UrlStatusChecker
 
@@ -631,3 +632,222 @@ def test_checksum_appears_in_to_dict():
     assert payload["content_length"] == 4
     assert payload["content_type"] == "text/html"
     assert payload["content_truncated"] is False
+
+
+# --------------------------------------------------------------------------- #
+# IP pinning — the DNS-rebinding TOCTOU fix.
+#
+# `run_check`/`responder` above inject a pre-built `client=` (a MockTransport
+# wrapping the handler directly), which never goes through pinning at all —
+# see `UrlStatusChecker._build_and_maybe_pin`'s docstring. These tests instead
+# let `UrlStatusChecker` build its own client, handing it a `transport=` fake
+# so the pinning code path itself runs, against a mocked resolver instead of
+# real DNS.
+# --------------------------------------------------------------------------- #
+
+
+def run_pinned_check(handler, resolver, url="https://example.com/", **option_overrides):
+    """Like `run_check`, but exercises real pinning: `UrlStatusChecker`
+    builds its own client (so `_owns_client` is True and pinning engages),
+    wired to a fake `transport=` instead of the network and a fake
+    `resolve_addresses` instead of real DNS."""
+    options = StatusCheckOptions(**option_overrides)
+
+    async def main():
+        async with UrlStatusChecker(options, transport=httpx.MockTransport(handler)) as checker:
+            return await checker.check(url)
+
+    original = ssrf_guard.resolve_addresses
+    ssrf_guard.resolve_addresses = resolver
+    try:
+        return asyncio.run(main())
+    finally:
+        ssrf_guard.resolve_addresses = original
+
+
+def test_the_pinned_connection_targets_the_resolved_address():
+    """The socket connects to the resolved IP; the wire-level Host header and
+    TLS SNI stay the hostname the operator actually asked for."""
+    seen = {}
+
+    def handler(request):
+        seen["url_host"] = request.url.host
+        seen["host_header"] = request.headers.get("host")
+        seen["sni_hostname"] = request.extensions.get("sni_hostname")
+        return httpx.Response(200)
+
+    async def resolver(host):
+        assert host == "example.com"
+        return ["93.184.216.34"]
+
+    status = run_pinned_check(handler, resolver, checksum=False)
+
+    assert status.state == "ok"
+    assert seen["url_host"] == "93.184.216.34"
+    assert seen["host_header"] == "example.com"
+    assert seen["sni_hostname"] == "example.com"
+
+
+def test_pinning_reuses_the_single_resolution_rather_than_re_resolving():
+    """The core DNS-rebinding proof: a resolver that answers differently on
+    successive lookups (public IP, then a blocked one) must only ever be
+    consulted once for a given hop, and the connection must land on that
+    first, safe address — never on what a second, independent lookup would
+    have returned. This is what closes the TOCTOU race: nothing re-resolves
+    between "this looked safe" and "here is where we actually connected"."""
+    seen = {}
+    calls: list[str] = []
+
+    def handler(request):
+        seen["url_host"] = request.url.host
+        return httpx.Response(200)
+
+    async def resolver(host):
+        calls.append(host)
+        # A hypothetical second lookup for this host would answer with cloud
+        # instance metadata — proving the fix never makes that second call.
+        return ["8.8.8.8"] if len(calls) == 1 else ["169.254.169.254"]
+
+    status = run_pinned_check(handler, resolver, checksum=False)
+
+    assert status.state == "ok"
+    assert calls == ["example.com"]  # exactly one lookup, not two
+    assert seen["url_host"] == "8.8.8.8"  # the safe, first-looked-up address
+    assert seen["url_host"] != "169.254.169.254"
+
+
+def test_a_hop_whose_pin_time_resolution_flips_to_blocked_is_rejected():
+    """The attack this whole fix is about: a redirect target answers the
+    loop's own pre-check (`is_unsafe_redirect`) with a public IP — passing it
+    — and then, by the time the connection is actually pinned moments later,
+    a short-TTL record answers with cloud metadata instead. The old code
+    would have handed the *hostname* to httpx and let it connect wherever a
+    fresh lookup pointed; pinning validates the exact address it is about to
+    use, so this hop is blocked instead of connected to."""
+    calls: list[str] = []
+
+    def handler(request):
+        if request.url.host == "93.184.216.34":
+            return httpx.Response(302, headers={"Location": "https://attacker.example/"})
+        raise AssertionError("must never connect to the redirect target")  # pragma: no cover
+
+    async def resolver(host):
+        if host == "attacker.example":
+            calls.append(host)
+            # 1st call: the loop's `is_unsafe_redirect` pre-check — public, passes.
+            # 2nd call: `_resolve_hop`'s pin-time resolution — rebound to metadata.
+            return ["8.8.4.4"] if len(calls) == 1 else ["169.254.169.254"]
+        return ["93.184.216.34"]
+
+    status = run_pinned_check(handler, resolver, checksum=False)
+
+    assert status.state == "redirect_broken"
+    assert "blocked" in status.error
+    assert "attacker.example" in status.error
+
+
+def test_pinning_is_never_applied_to_the_operators_own_target():
+    """The initial target — and any same-host hop — is pinned (still
+    connects to a single resolved address, not re-resolved) but never
+    *validated* against the blocklist, mirroring `is_unsafe_redirect`'s
+    same-host exemption: it is the operator's deliberate choice, address and
+    all."""
+    seen = {}
+
+    def handler(request):
+        seen["url_host"] = request.url.host
+        return httpx.Response(200)
+
+    async def resolver(host):
+        assert host == "internal.example"
+        return ["10.0.0.5"]  # private — allowed only because it's the target itself
+
+    status = run_pinned_check(handler, resolver, url="https://internal.example/", checksum=False)
+
+    assert status.state == "ok"
+    assert seen["url_host"] == "10.0.0.5"
+
+
+def test_a_pin_time_lookup_failure_falls_back_to_the_hostname_unpinned():
+    """Our own resolution failing is not a block — httpx gets the plain
+    hostname and reports its own connect failure the usual way, exactly as
+    it would without pinning at all."""
+    seen = {}
+
+    def handler(request):
+        seen["url_host"] = request.url.host
+        return httpx.Response(200)
+
+    async def resolver(host):
+        raise OSError("Name or service not known")
+
+    status = run_pinned_check(handler, resolver, checksum=False)
+
+    assert status.state == "ok"
+    assert seen["url_host"] == "example.com"
+
+
+def test_a_literal_blocked_ip_redirect_target_is_rejected_without_dns():
+    """A redirect straight to a literal address needs no DNS lookup at all —
+    resolve_addresses/getaddrinfo resolves a numeric host locally — and is
+    still validated and rejected."""
+    calls: list[str] = []
+
+    def handler(request):
+        if request.url.host == "93.184.216.34":
+            return httpx.Response(302, headers={"Location": "http://169.254.169.254/latest/meta-data/"})
+        raise AssertionError("must never connect to the metadata address")  # pragma: no cover
+
+    async def resolver(host):
+        calls.append(host)
+        return ["93.184.216.34"]
+
+    status = run_pinned_check(handler, resolver, checksum=False)
+
+    assert status.state == "redirect_broken"
+    assert "blocked" in status.error
+    # The redirect target itself is a literal IP: no hostname to resolve.
+    assert "169.254.169.254" not in calls
+
+
+def test_checksum_fetch_is_pinned_too():
+    """The body-hashing GET after the walk settles is its own connection and
+    gets the same treatment as every other hop."""
+    seen = {}
+    body = b"<h1>hi</h1>"
+
+    def handler(request):
+        if request.method == "HEAD":
+            return httpx.Response(200)
+        seen["url_host"] = request.url.host
+        return httpx.Response(200, content=body, headers={"content-type": "text/html"})
+
+    async def resolver(host):
+        return ["93.184.216.34"]
+
+    status = run_pinned_check(handler, resolver, checksum=True)
+
+    assert status.content_checksum is not None
+    assert seen["url_host"] == "93.184.216.34"
+
+
+def test_pinning_does_not_engage_for_an_injected_test_client():
+    """An injected `client=` (every other test in this file) never pins —
+    there is no real socket to pin, and a mocked resolver here must not even
+    be consulted."""
+
+    def handler(request):
+        assert request.url.host == "example.com"
+        return httpx.Response(200)
+
+    async def never_called(host):  # pragma: no cover - the whole point of the assertion
+        raise AssertionError("resolve_addresses must not be called for an injected client")
+
+    original = ssrf_guard.resolve_addresses
+    ssrf_guard.resolve_addresses = never_called
+    try:
+        status = run_check(handler, checksum=False)
+    finally:
+        ssrf_guard.resolve_addresses = original
+
+    assert status.state == "ok"
