@@ -9,7 +9,7 @@ description = "Screenshot URLs with a headless browser and check them for expose
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "playwright>=1.44",
+    "playwright>=1.48",
     "httpx>=0.27",
 ]
 

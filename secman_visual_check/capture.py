@@ -72,6 +72,39 @@ def _make_secure_route_handler(
     return handler
 
 
+def _make_secure_websocket_handler(original_url: str, block_private_redirects: bool):
+    """WebSocket analogue of :func:`_make_secure_route_handler`.
+
+    ``page.route()`` (the handler above) only intercepts HTTP(S) navigations
+    and subresources — Playwright does not route ``WebSocket`` connections
+    through it at all. A compromised or malicious target's own JS can open
+    ``new WebSocket("ws://169.254.169.254/...")`` (or any internal host) and
+    Chromium will connect completely unrestricted, bypassing the SSRF guard
+    entirely and, same as the HTTP case, feeding whatever comes back into the
+    page (and from there potentially into ``capture.text_excerpt``, the AI
+    analyzer and the reports). ``page.route_web_socket()`` is the dedicated
+    Playwright API for intercepting these; register this handler with it.
+
+    A blocked destination is closed via :meth:`WebSocketRoute.close` before
+    ever reaching the real network. An allowed one is passed through
+    unmodified by connecting to the real server and piping messages both
+    ways — this handler does not (and does not need to) inject
+    ``extra_headers``/``basic_auth``, since those only apply to the initial
+    HTTP handshake, which is already covered by the page-level HTTP handler.
+    """
+
+    async def handler(ws):
+        if block_private_redirects and await is_unsafe_redirect(original_url, ws.url):
+            await ws.close(code=1008, reason="blocked: private network destination")
+            return
+
+        server = ws.connect_to_server()
+        ws.on_message(lambda message: server.send(message))
+        server.on_message(lambda message: ws.send(message))
+
+    return handler
+
+
 def _make_context_guard_handler(block_private_redirects: bool):
     """Build the browser-context-level route handler that closes the popup gap.
 
@@ -104,6 +137,31 @@ def _make_context_guard_handler(block_private_redirects: bool):
             await route.abort()
             return
         await route.continue_()
+
+    return handler
+
+
+def _make_context_websocket_guard_handler(block_private_redirects: bool):
+    """WebSocket analogue of :func:`_make_context_guard_handler`.
+
+    Closes the same popup/new-tab gap as the context-level HTTP guard, for
+    WebSocket connections specifically — see :func:`_make_secure_websocket_handler`
+    for why ``page.route_web_socket()`` needs its own registration separate
+    from ``page.route()``. Installed once via ``context.route_web_socket()``
+    in ``BrowserCapturer.__aenter__``, alongside the existing HTTP context
+    guard, so it covers every page (including popups) this context ever
+    creates. Like its HTTP counterpart, there is no same-host exemption here:
+    a popup was never a URL the operator asked to visit.
+    """
+
+    async def handler(ws):
+        if block_private_redirects and await is_unsafe_destination(ws.url):
+            await ws.close(code=1008, reason="blocked: private network destination")
+            return
+
+        server = ws.connect_to_server()
+        ws.on_message(lambda message: server.send(message))
+        server.on_message(lambda message: ws.send(message))
 
     return handler
 
@@ -235,6 +293,9 @@ class BrowserCapturer:
             await self._context.route(
                 "**/*", _make_context_guard_handler(self.options.block_private_redirects)
             )
+            await self._context.route_web_socket(
+                "**/*", _make_context_websocket_guard_handler(self.options.block_private_redirects)
+            )
         self._screenshot_lock = asyncio.Lock()
         return self
 
@@ -287,6 +348,10 @@ class BrowserCapturer:
                     self.options.basic_auth,
                     self.options.block_private_redirects,
                 ),
+            )
+        if self.options.block_private_redirects:
+            await page.route_web_socket(
+                "**/*", _make_secure_websocket_handler(url, self.options.block_private_redirects)
             )
 
         try:
