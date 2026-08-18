@@ -8,7 +8,9 @@ from secman_visual_check.capture import (
     BrowserCapturer,
     CaptureOptions,
     _make_context_guard_handler,
+    _make_context_websocket_guard_handler,
     _make_secure_route_handler,
+    _make_secure_websocket_handler,
     screenshot_filename,
 )
 
@@ -306,6 +308,125 @@ def test_context_guard_respects_the_disable_flag():
 
 
 # --------------------------------------------------------------------------- #
+# WebSocket SSRF gap — page.route()/context.route() only intercept HTTP(S);
+# Playwright does not route WebSocket connections through them at all, so a
+# target's own JS could `new WebSocket("ws://169.254.169.254/...")` completely
+# unrestricted. page.route_web_socket()/context.route_web_socket() are the
+# dedicated APIs for this and need their own guard, mirroring the HTTP one.
+# --------------------------------------------------------------------------- #
+
+
+class FakeServerWebSocketRoute:
+    """Stands in for the server-side WebSocketRoute connect_to_server() returns."""
+
+    def __init__(self):
+        self.on_message_callback = None
+        self.sent = []
+
+    def on_message(self, callback):
+        self.on_message_callback = callback
+
+    def send(self, message):
+        self.sent.append(message)
+
+
+class FakeWebSocketRoute:
+    def __init__(self, url):
+        self.url = url
+        self.closed = None
+        self.connected_server = None
+        self.on_message_callback = None
+        self.sent = []
+
+    async def close(self, *, code=None, reason=None):
+        self.closed = {"code": code, "reason": reason}
+
+    def connect_to_server(self):
+        self.connected_server = FakeServerWebSocketRoute()
+        return self.connected_server
+
+    def on_message(self, callback):
+        self.on_message_callback = callback
+
+    def send(self, message):
+        self.sent.append(message)
+
+
+def test_websocket_handler_closes_cross_host_redirect_to_a_private_address():
+    handler = _make_secure_websocket_handler("https://example.com/", block_private_redirects=True)
+    ws = FakeWebSocketRoute("ws://169.254.169.254/latest/meta-data/")
+
+    run(handler(ws))
+
+    assert ws.closed is not None
+    assert ws.connected_server is None
+
+
+def test_websocket_handler_allows_a_same_host_connection():
+    """Same-host exemption mirrors the HTTP handler: a WS back to the
+    operator's own target host is never blocked, and is proxied through to
+    the real server so the tool's own screenshot/analysis flow still works."""
+    handler = _make_secure_websocket_handler("https://example.com/", block_private_redirects=True)
+    ws = FakeWebSocketRoute("wss://example.com/socket")
+
+    run(handler(ws))
+
+    assert ws.closed is None
+    assert ws.connected_server is not None
+
+
+def test_websocket_handler_allows_a_public_cross_host_destination():
+    handler = _make_secure_websocket_handler("https://example.com/", block_private_redirects=True)
+    ws = FakeWebSocketRoute("wss://other-public-site.example/socket")
+
+    run(handler(ws))
+
+    assert ws.closed is None
+    assert ws.connected_server is not None
+
+
+def test_websocket_handler_respects_the_disable_flag():
+    handler = _make_secure_websocket_handler("https://example.com/", block_private_redirects=False)
+    ws = FakeWebSocketRoute("ws://169.254.169.254/")
+
+    run(handler(ws))
+
+    assert ws.closed is None
+    assert ws.connected_server is not None
+
+
+def test_context_websocket_guard_closes_a_private_destination():
+    """No same-host exemption here, same as the HTTP context guard: a popup
+    was never a URL the operator asked to visit."""
+    handler = _make_context_websocket_guard_handler(block_private_redirects=True)
+    ws = FakeWebSocketRoute("ws://169.254.169.254/latest/meta-data/")
+
+    run(handler(ws))
+
+    assert ws.closed is not None
+    assert ws.connected_server is None
+
+
+def test_context_websocket_guard_allows_a_public_destination():
+    handler = _make_context_websocket_guard_handler(block_private_redirects=True)
+    ws = FakeWebSocketRoute("wss://other-public-site.example/socket")
+
+    run(handler(ws))
+
+    assert ws.closed is None
+    assert ws.connected_server is not None
+
+
+def test_context_websocket_guard_respects_the_disable_flag():
+    handler = _make_context_websocket_guard_handler(block_private_redirects=False)
+    ws = FakeWebSocketRoute("ws://169.254.169.254/")
+
+    run(handler(ws))
+
+    assert ws.closed is None
+
+
+# --------------------------------------------------------------------------- #
 # Wiring: BrowserCapturer.__aenter__ must install the context-level guard —
 # this is what actually covers a popup Chromium creates outside of any single
 # capture() call. Faked in the same spirit as FakePage/FakeRoute above: no
@@ -317,12 +438,16 @@ def test_context_guard_respects_the_disable_flag():
 class FakePWContext:
     def __init__(self):
         self.routes: list[tuple[str, object]] = []
+        self.websocket_routes: list[tuple[str, object]] = []
 
     def set_default_timeout(self, _timeout):
         pass
 
     async def route(self, pattern, handler):
         self.routes.append((pattern, handler))
+
+    async def route_web_socket(self, pattern, handler):
+        self.websocket_routes.append((pattern, handler))
 
     async def new_page(self):
         return FakePage({"active": 0, "peak": 0, "calls": []})
@@ -397,6 +522,16 @@ def test_aenter_registers_the_context_level_guard(tmp_path, monkeypatch):
     run(handler(route))
     assert route.aborted is True
 
+    # The WebSocket guard is registered too — page.route() alone leaves
+    # WebSocket connections completely unrestricted.
+    assert len(fake_context.websocket_routes) == 1
+    ws_pattern, ws_handler = fake_context.websocket_routes[0]
+    assert ws_pattern == "**/*"
+
+    ws = FakeWebSocketRoute("ws://169.254.169.254/latest/meta-data/")
+    run(ws_handler(ws))
+    assert ws.closed is not None
+
 
 def test_aenter_skips_the_context_guard_when_disabled(tmp_path, monkeypatch):
     fake_context = FakePWContext()
@@ -422,3 +557,4 @@ def test_aenter_skips_the_context_guard_when_disabled(tmp_path, monkeypatch):
     run(go())
 
     assert fake_context.routes == []
+    assert fake_context.websocket_routes == []
