@@ -72,6 +72,41 @@ def _make_secure_route_handler(
     return handler
 
 
+def _make_context_websocket_guard_handler(block_private_redirects: bool):
+    """Build the browser-context-level handler that closes the WebSocket gap.
+
+    Playwright's request interception — ``page.route()`` / ``context.route()``,
+    which both ``_make_secure_route_handler`` and ``_make_context_guard_handler``
+    above are built on — does **not** apply to WebSocket connections at all;
+    Playwright ships a separate API, ``route_web_socket()``, specifically
+    because ``route()`` never sees them. Without this handler, a scanned
+    target's own ``new WebSocket("ws://169.254.169.254/...")`` (or any other
+    internal host) opens completely unguarded — none of the SSRF checks above
+    fire — and a page that reflects the received frames into the DOM turns
+    that into the same exfiltration path ``_make_secure_route_handler``
+    documents for ``fetch()``/XHR: straight into ``text_excerpt``, the
+    screenshot, the AI analysis and every report.
+
+    A routed WebSocket does **not** connect to the real server unless the
+    handler calls ``connect_to_server()`` — so blocking is just not calling
+    it (plus explicitly closing the page-side socket so it fails fast rather
+    than hanging); allowing means connecting it through, after which
+    Playwright forwards messages both ways automatically. Installed once via
+    ``context.route_web_socket()`` in ``BrowserCapturer.__aenter__`` — the API
+    only routes sockets created *after* registration, so it must happen
+    before any page (and therefore any WebSocket) exists, exactly like the
+    ``context.route()`` guard beside it.
+    """
+
+    async def handler(ws_route):
+        if block_private_redirects and await is_unsafe_destination(ws_route.url):
+            await ws_route.close(code=1008, reason="blocked: private/internal address")
+            return
+        ws_route.connect_to_server()
+
+    return handler
+
+
 def _make_context_guard_handler(block_private_redirects: bool):
     """Build the browser-context-level route handler that closes the popup gap.
 
@@ -127,9 +162,10 @@ class CaptureOptions:
     browser_channel: str | None = None
     executable_path: str | None = None
     #: A compromised or malicious target can redirect (or embed an iframe
-    #: pointing) at 169.254.169.254, 127.0.0.1, or other internal addresses;
-    #: on by default, blocks navigation to such a host unless it matches the
-    #: host originally requested. See ssrf_guard.py.
+    #: pointing, or open a fetch()/XHR/WebSocket to) 169.254.169.254,
+    #: 127.0.0.1, or other internal addresses; on by default, blocks
+    #: navigation and connections to such a host unless it matches the host
+    #: originally requested. See ssrf_guard.py.
     block_private_redirects: bool = True
 
 
@@ -234,6 +270,13 @@ class BrowserCapturer:
         if self.options.block_private_redirects:
             await self._context.route(
                 "**/*", _make_context_guard_handler(self.options.block_private_redirects)
+            )
+            # WebSocket connections are not covered by context.route() above —
+            # see _make_context_websocket_guard_handler — so they need their
+            # own guard, registered the same way and for the same reason:
+            # before any page (and therefore any socket) is created.
+            await self._context.route_web_socket(
+                "**/*", _make_context_websocket_guard_handler(self.options.block_private_redirects)
             )
         self._screenshot_lock = asyncio.Lock()
         return self

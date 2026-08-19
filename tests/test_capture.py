@@ -8,6 +8,7 @@ from secman_visual_check.capture import (
     BrowserCapturer,
     CaptureOptions,
     _make_context_guard_handler,
+    _make_context_websocket_guard_handler,
     _make_secure_route_handler,
     screenshot_filename,
 )
@@ -306,6 +307,68 @@ def test_context_guard_respects_the_disable_flag():
 
 
 # --------------------------------------------------------------------------- #
+# Finding 3 — page.route()/context.route() never see WebSocket connections at
+# all (Playwright ships a separate route_web_socket() API precisely because of
+# this), so a scanned target's own `new WebSocket("ws://169.254.169.254/...")`
+# was completely unguarded by every check above. Covered by a dedicated
+# context-level WebSocket guard.
+# --------------------------------------------------------------------------- #
+
+
+class FakeWebSocketRoute:
+    def __init__(self, url):
+        self.url = url
+        self.closed_with: dict | None = None
+        self.connected = False
+
+    async def close(self, *, code=None, reason=None):
+        self.closed_with = {"code": code, "reason": reason}
+
+    def connect_to_server(self):
+        self.connected = True
+
+
+def test_websocket_guard_closes_a_private_destination():
+    handler = _make_context_websocket_guard_handler(block_private_redirects=True)
+    ws = FakeWebSocketRoute("ws://169.254.169.254/latest/meta-data/")
+
+    run(handler(ws))
+
+    assert ws.closed_with is not None
+    assert ws.connected is False
+
+
+def test_websocket_guard_closes_a_loopback_destination():
+    handler = _make_context_websocket_guard_handler(block_private_redirects=True)
+    ws = FakeWebSocketRoute("ws://127.0.0.1:6379/")
+
+    run(handler(ws))
+
+    assert ws.closed_with is not None
+    assert ws.connected is False
+
+
+def test_websocket_guard_allows_a_public_destination():
+    handler = _make_context_websocket_guard_handler(block_private_redirects=True)
+    ws = FakeWebSocketRoute("wss://other-public-site.example/socket")
+
+    run(handler(ws))
+
+    assert ws.closed_with is None
+    assert ws.connected is True
+
+
+def test_websocket_guard_respects_the_disable_flag():
+    handler = _make_context_websocket_guard_handler(block_private_redirects=False)
+    ws = FakeWebSocketRoute("ws://169.254.169.254/latest/meta-data/")
+
+    run(handler(ws))
+
+    assert ws.closed_with is None
+    assert ws.connected is True
+
+
+# --------------------------------------------------------------------------- #
 # Wiring: BrowserCapturer.__aenter__ must install the context-level guard —
 # this is what actually covers a popup Chromium creates outside of any single
 # capture() call. Faked in the same spirit as FakePage/FakeRoute above: no
@@ -317,12 +380,16 @@ def test_context_guard_respects_the_disable_flag():
 class FakePWContext:
     def __init__(self):
         self.routes: list[tuple[str, object]] = []
+        self.websocket_routes: list[tuple[str, object]] = []
 
     def set_default_timeout(self, _timeout):
         pass
 
     async def route(self, pattern, handler):
         self.routes.append((pattern, handler))
+
+    async def route_web_socket(self, pattern, handler):
+        self.websocket_routes.append((pattern, handler))
 
     async def new_page(self):
         return FakePage({"active": 0, "peak": 0, "calls": []})
@@ -397,6 +464,16 @@ def test_aenter_registers_the_context_level_guard(tmp_path, monkeypatch):
     run(handler(route))
     assert route.aborted is True
 
+    # The WebSocket guard is a separate Playwright API (route() never sees
+    # WebSockets) and must be registered too, before any page exists.
+    assert len(fake_context.websocket_routes) == 1
+    ws_pattern, ws_handler = fake_context.websocket_routes[0]
+    assert ws_pattern == "**/*"
+    ws = FakeWebSocketRoute("ws://169.254.169.254/latest/meta-data/")
+    run(ws_handler(ws))
+    assert ws.closed_with is not None
+    assert ws.connected is False
+
 
 def test_aenter_skips_the_context_guard_when_disabled(tmp_path, monkeypatch):
     fake_context = FakePWContext()
@@ -422,3 +499,4 @@ def test_aenter_skips_the_context_guard_when_disabled(tmp_path, monkeypatch):
     run(go())
 
     assert fake_context.routes == []
+    assert fake_context.websocket_routes == []
