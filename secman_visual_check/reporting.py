@@ -133,6 +133,7 @@ def _redact_analysis(analysis: Analysis | None, secrets: Sequence[str]) -> Analy
         summary=redact(analysis.summary, secrets),
         page_type=redact(analysis.page_type, secrets),
         error=_redact_or_none(analysis.error, secrets),
+        raw_response=_redact_or_none(analysis.raw_response, secrets),
         findings=[_redact_finding(f, secrets) for f in analysis.findings],
     )
 

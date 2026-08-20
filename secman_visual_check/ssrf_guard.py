@@ -78,6 +78,33 @@ async def is_unsafe_redirect(original_url: str, redirect_url: str) -> bool:
     return await _resolves_to_blocked_ip(redirect_host)
 
 
+def is_unsafe_connected_addr(original_url: str, response_url: str, remote_ip: str | None) -> bool:
+    """True if a request's *actual* connected address should be blocked as an
+    SSRF hop, after the fact.
+
+    ``is_unsafe_redirect``/``is_unsafe_destination`` decide *before* the
+    request is sent, from this module's own DNS lookup. That lookup can race
+    the browser's (or HTTP client's) independent resolution of the same
+    hostname moments later — a classic DNS-rebinding TOCTOU: a malicious
+    target's nameserver answers the guard's lookup with a public IP and the
+    real connection's lookup with ``169.254.169.254``/``127.0.0.1``/an
+    RFC-1918 address, defeating the pre-connect guard entirely for the exact
+    attacker already in scope (one who controls the target's DNS).
+
+    This closes that gap for callers that can report the address a
+    connection *actually* used (a browser response's ``server_addr()``, an
+    HTTP client's transport/connection info) — no further DNS lookup is
+    performed, so there is nothing left to race. Same same-host exemption as
+    ``is_unsafe_redirect``: the operator's own original target is never
+    blocked, whatever it resolves to.
+    """
+    if remote_ip is None:
+        return False
+    if same_host(original_url, response_url):
+        return False
+    return _is_blocked_ip(remote_ip)
+
+
 async def is_unsafe_destination(url: str) -> bool:
     """True if ``url``'s host is a private/loopback/link-local/reserved address.
 
