@@ -16,6 +16,7 @@ from .models import (
     Analysis,
     Finding,
     PageCapture,
+    RedirectHop,
     ScanReport,
     ScanResult,
     Severity,
@@ -85,10 +86,14 @@ STATUS_DISPLAY_ORDER = (
 #: passed via ``--basic-auth pass://vault/item/password``) back in its body
 #: or error page puts it in ``capture.text_excerpt``/``load_error``, and from
 #: there into the screenshot's extracted text, the AI analyzer's summary, and
-#: every report format. ``redact_report`` scrubs every such target-influenced
-#: text field before a renderer sees it — structural fields (URLs, status
-#: codes, timestamps, config echoes like ``model``) are left untouched, since
-#: scrubbing those would corrupt the report rather than protect anything.
+#: every report format. The same reflection can land in a ``Location``
+#: header, which ``status.py``/``capture.py`` record verbatim into
+#: ``final_url``/the redirect chain — so those are target-influenced text
+#: too, not structural data, and get the same scrubbing. Genuinely
+#: structural fields (status codes, timestamps, config echoes like
+#: ``model``) are left untouched, since scrubbing those would corrupt the
+#: report rather than protect anything, and ``redact`` is a no-op on any
+#: value that doesn't literally contain a resolved secret.
 
 
 def _redact_or_none(value: str | None, secrets: Sequence[str]) -> str | None:
@@ -97,11 +102,20 @@ def _redact_or_none(value: str | None, secrets: Sequence[str]) -> str | None:
     return redact(value, secrets)
 
 
+def _redact_hop(hop: RedirectHop, secrets: Sequence[str]) -> RedirectHop:
+    return replace(
+        hop,
+        url=redact(hop.url, secrets),
+        location=_redact_or_none(hop.location, secrets),
+    )
+
+
 def _redact_capture(capture: PageCapture | None, secrets: Sequence[str]) -> PageCapture | None:
     if capture is None:
         return None
     return replace(
         capture,
+        final_url=_redact_or_none(capture.final_url, secrets),
         title=_redact_or_none(capture.title, secrets),
         text_excerpt=redact(capture.text_excerpt, secrets),
         load_error=_redact_or_none(capture.load_error, secrets),
@@ -112,7 +126,12 @@ def _redact_capture(capture: PageCapture | None, secrets: Sequence[str]) -> Page
 def _redact_status(status: UrlStatus | None, secrets: Sequence[str]) -> UrlStatus | None:
     if status is None:
         return None
-    return replace(status, error=_redact_or_none(status.error, secrets))
+    return replace(
+        status,
+        final_url=_redact_or_none(status.final_url, secrets),
+        chain=[_redact_hop(hop, secrets) for hop in status.chain],
+        error=_redact_or_none(status.error, secrets),
+    )
 
 
 def _redact_finding(finding: Finding, secrets: Sequence[str]) -> Finding:
@@ -133,6 +152,7 @@ def _redact_analysis(analysis: Analysis | None, secrets: Sequence[str]) -> Analy
         summary=redact(analysis.summary, secrets),
         page_type=redact(analysis.page_type, secrets),
         error=_redact_or_none(analysis.error, secrets),
+        raw_response=_redact_or_none(analysis.raw_response, secrets),
         findings=[_redact_finding(f, secrets) for f in analysis.findings],
     )
 

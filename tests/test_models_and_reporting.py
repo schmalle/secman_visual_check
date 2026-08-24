@@ -539,10 +539,12 @@ SECRET = "s3cretPassw0rd"
 
 def make_report_with_secret(secret: str = SECRET) -> ScanReport:
     """A report shaped like a target that reflected a resolved credential
-    back into every text field a renderer might print."""
+    back into every text field a renderer might print — including a
+    ``Location`` header reflecting it into a redirect hop / final URL, and
+    the AI analyzer's raw model reply."""
     capture = PageCapture(
         url="https://example.com/",
-        final_url="https://example.com/",
+        final_url=f"https://example.com/denied?attempted={secret}",
         status=401,
         title=f"Unauthorized for {secret}",
         text_excerpt=f"Access denied: bad credentials '{secret}'",
@@ -553,6 +555,7 @@ def make_report_with_secret(secret: str = SECRET) -> ScanReport:
         risk_level=Severity.LOW,
         summary=f"The page reflected the credential {secret} back in its body.",
         page_type=f"error page mentioning {secret}",
+        raw_response=f"{{\"summary\": \"saw credential {secret} in the page\"}}",
         findings=[
             Finding(
                 category=f"leaked_{secret}",
@@ -568,6 +571,14 @@ def make_report_with_secret(secret: str = SECRET) -> ScanReport:
         state="client_error",
         first_status=401,
         final_status=401,
+        final_url=f"https://example.com/denied?attempted={secret}",
+        chain=[
+            RedirectHop(
+                url="https://example.com/",
+                status=302,
+                location=f"https://example.com/denied?attempted={secret}",
+            ),
+        ],
         error=f"HTTP 401: {secret}",
     )
     report = ScanReport(model="test/model", tool_version="0.2.0")
@@ -596,33 +607,71 @@ def test_redact_report_scrubs_every_target_influenced_text_field():
     assert SECRET not in result.capture.text_excerpt
     assert SECRET not in result.capture.load_error
     assert SECRET not in result.capture.console_errors[0]
+    assert SECRET not in result.capture.final_url
     assert SECRET not in result.status_check.error
+    assert SECRET not in result.status_check.final_url
+    assert SECRET not in result.status_check.chain[0].url
+    assert SECRET not in result.status_check.chain[0].location
     assert SECRET not in result.analysis.summary
     assert SECRET not in result.analysis.page_type
+    assert SECRET not in result.analysis.raw_response
     assert SECRET not in result.analysis.findings[0].category
     assert SECRET not in result.analysis.findings[0].title
     assert SECRET not in result.analysis.findings[0].evidence
     assert SECRET not in result.analysis.findings[0].recommendation
     assert SECRET not in (result.error or "")
     assert "<redacted>" in result.capture.title
+    assert "<redacted>" in result.capture.final_url
+    assert "<redacted>" in result.status_check.chain[0].location
 
 
 def test_redact_report_leaves_structural_fields_alone():
-    """URLs, status codes and IDs must survive — only free text is scrubbed."""
+    """URLs, status codes and IDs must survive — only free text (including a
+    reflected credential inside a URL) is scrubbed."""
     report = redact_report(make_report_with_secret(), [SECRET])
     result = report.results[0]
 
     assert result.url == "https://example.com/"
     assert result.capture.url == "https://example.com/"
-    assert result.capture.final_url == "https://example.com/"
     assert result.capture.status == 401
     assert result.status_check.first_status == 401
     assert result.status_check.final_status == 401
+    assert result.status_check.chain[0].url == "https://example.com/"
+    assert result.status_check.chain[0].status == 302
+
+
+def test_redact_report_final_url_is_untouched_when_no_secret_is_reflected():
+    """The common, non-attack case: redaction must not corrupt a URL that
+    never contained a resolved secret."""
+    report = make_report_with_secret()
+    report.results[0].capture.final_url = "https://example.com/"
+    report.results[0].status_check.final_url = "https://example.com/"
+    report.results[0].status_check.chain = []
+
+    result = redact_report(report, [SECRET]).results[0]
+
+    assert result.capture.final_url == "https://example.com/"
+    assert result.status_check.final_url == "https://example.com/"
 
 
 def test_json_report_redacts_a_reflected_secret(tmp_path):
     path = write_json_report(
         make_report_with_secret(), tmp_path / "report.json", secrets=[SECRET]
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    assert "<redacted>" in text
+
+
+def test_json_report_with_raw_response_redacts_a_reflected_secret(tmp_path):
+    """``--include-raw`` embeds the AI analyzer's raw model reply verbatim —
+    it must be scrubbed exactly like every other target-influenced field."""
+    path = write_json_report(
+        make_report_with_secret(),
+        tmp_path / "report.json",
+        include_raw=True,
+        secrets=[SECRET],
     )
     text = path.read_text(encoding="utf-8")
 
