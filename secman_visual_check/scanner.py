@@ -38,7 +38,11 @@ async def run_scan(
 
     capture_sem = asyncio.Semaphore(max(1, config.concurrency))
     analysis_sem = asyncio.Semaphore(max(1, config.ai_concurrency))
-    robots = RobotsCache() if config.respect_robots else None
+    robots = (
+        RobotsCache(block_private_redirects=config.capture.block_private_redirects)
+        if config.respect_robots
+        else None
+    )
 
     results: list[ScanResult | None] = [None] * len(targets)
     completed = 0
