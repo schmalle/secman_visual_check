@@ -191,6 +191,43 @@ def test_progress_hook_prefixes_the_status(capsys):
     assert "[2/2] https://dead.example/ -> unreachable | error: TimeoutError" in err
 
 
+def test_progress_hook_redacts_resolved_secrets_from_errors(capsys):
+    # result.error / capture.load_error can carry text a scanned target
+    # controls (a rejected-credential provider error, a page that quotes
+    # back the headers it received). This is the same threat
+    # reporting.redact_report() guards against for the on-disk reports; the
+    # progress line is printed live, before that redaction runs, so it needs
+    # the same scrubbing applied directly.
+    hook = _progress_hook(quiet=False, secrets=["sk-super-secret-token"])
+    result = ScanResult(
+        url="https://example.com/",
+        error="RuntimeError: HTTP 401: key sk-super-secret-token rejected",
+    )
+
+    hook(result, 1, 1)
+    err = capsys.readouterr().err
+
+    assert "sk-super-secret-token" not in err
+    assert "<redacted>" in err
+
+
+def test_progress_hook_redacts_resolved_secrets_from_load_errors(capsys):
+    hook = _progress_hook(quiet=False, secrets=["hunter2password"])
+    result = ScanResult(
+        url="https://example.com/",
+        capture=PageCapture(
+            url="https://example.com/",
+            load_error="net::ERR_ABORTED, Authorization: Basic hunter2password",
+        ),
+    )
+
+    hook(result, 1, 1)
+    err = capsys.readouterr().err
+
+    assert "hunter2password" not in err
+    assert "<redacted>" in err
+
+
 def test_progress_hook_without_a_status_check_is_unchanged(capsys):
     _progress_hook(quiet=False)(ScanResult(url="https://example.com/"), 1, 1)
 
