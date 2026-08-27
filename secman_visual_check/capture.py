@@ -13,7 +13,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .models import PageCapture
-from .ssrf_guard import is_unsafe_destination, is_unsafe_redirect, same_host
+from .ssrf_guard import (
+    is_unsafe_connected_addr,
+    is_unsafe_destination,
+    is_unsafe_redirect,
+    same_host,
+)
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -289,6 +294,7 @@ class BrowserCapturer:
                 ),
             )
 
+        blocked_post_connect = False
         try:
             try:
                 response = await page.goto(
@@ -298,6 +304,23 @@ class BrowserCapturer:
                 )
                 if response is not None:
                     capture.status = response.status
+                    if options.block_private_redirects:
+                        # DNS-rebinding closer: is_unsafe_redirect()/is_unsafe_destination()
+                        # already vetted this navigation before Chromium connected, from
+                        # this process's own DNS lookup — which a malicious target's
+                        # nameserver can race against Chromium's independent lookup
+                        # moments later. Re-check the address Chromium *actually*
+                        # connected to; if that's a rebind onto a blocked address, the
+                        # page's content must not flow into text_excerpt, the
+                        # screenshot, or the AI analyzer (see ssrf_guard.is_unsafe_connected_addr).
+                        remote = await _safe(response.server_addr)
+                        remote_ip = remote.get("ipAddress") if remote else None
+                        if is_unsafe_connected_addr(url, response.url, remote_ip):
+                            blocked_post_connect = True
+                            capture.load_error = (
+                                "blocked: response served from a disallowed private/"
+                                "internal address (post-connect SSRF check)"
+                            )
             except PlaywrightError as exc:
                 # Keep going: a timed-out page often still has renderable content.
                 capture.load_error = _short_error(exc)
@@ -306,6 +329,10 @@ class BrowserCapturer:
                 await page.wait_for_timeout(options.settle_ms)
 
             capture.final_url = page.url
+
+            if blocked_post_connect:
+                return capture
+
             capture.title = await _safe(page.title)
             capture.text_excerpt = _truncate(
                 await _safe(lambda: page.inner_text("body")) or "",

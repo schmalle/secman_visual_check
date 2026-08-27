@@ -1,6 +1,11 @@
 import asyncio
 
-from secman_visual_check.ssrf_guard import is_unsafe_destination, is_unsafe_redirect, same_host
+from secman_visual_check.ssrf_guard import (
+    is_unsafe_connected_addr,
+    is_unsafe_destination,
+    is_unsafe_redirect,
+    same_host,
+)
 
 
 def run(coro):
@@ -78,3 +83,50 @@ def test_destination_has_no_same_host_exemption():
     # A private IP is unsafe regardless of what "host" it might otherwise be
     # compared against — there is no operator-chosen original URL here.
     assert run(is_unsafe_destination("http://169.254.169.254/"))
+
+
+# --------------------------------------------------------------------------- #
+# is_unsafe_connected_addr — the DNS-rebinding closer. Unlike the two guards
+# above, this never performs its own DNS lookup: it re-checks the address a
+# connection *actually* used, which the pre-connect guards' own lookup can
+# race against a hostile target's nameserver (TTL-0 rebinding: public IP to
+# the guard's lookup, private IP to the real connection's lookup moments
+# later).
+# --------------------------------------------------------------------------- #
+
+
+def test_connected_addr_rebind_to_metadata_ip_is_unsafe():
+    # The guard's pre-connect DNS check saw a public IP and allowed the
+    # redirect; the browser's own, later lookup landed on the metadata
+    # address instead. This is exactly the race this function closes.
+    assert is_unsafe_connected_addr(
+        "https://monitored.example/", "https://evil.example/", "169.254.169.254"
+    )
+
+
+def test_connected_addr_rebind_to_loopback_is_unsafe():
+    assert is_unsafe_connected_addr(
+        "https://monitored.example/", "https://evil.example/", "127.0.0.1"
+    )
+
+
+def test_connected_addr_public_ip_is_safe():
+    assert not is_unsafe_connected_addr(
+        "https://monitored.example/", "https://other-public-site.example/", "93.184.216.34"
+    )
+
+
+def test_connected_addr_same_host_is_always_safe():
+    # Same same-host exemption as is_unsafe_redirect: the operator's own
+    # target is never blocked, whatever address it actually connects to.
+    assert not is_unsafe_connected_addr(
+        "https://monitored.example/a", "https://monitored.example/b", "127.0.0.1"
+    )
+
+
+def test_connected_addr_missing_is_not_treated_as_unsafe():
+    # server_addr() can return None (e.g. a cached/service-worker response);
+    # that is not itself evidence of anything and must not false-positive.
+    assert not is_unsafe_connected_addr(
+        "https://monitored.example/", "https://evil.example/", None
+    )

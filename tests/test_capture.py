@@ -422,3 +422,136 @@ def test_aenter_skips_the_context_guard_when_disabled(tmp_path, monkeypatch):
     run(go())
 
     assert fake_context.routes == []
+
+
+# --------------------------------------------------------------------------- #
+# capture() end-to-end against a fake browser context — exercises the
+# post-connect DNS-rebinding closer (ssrf_guard.is_unsafe_connected_addr):
+# the pre-connect guard's own DNS lookup can be raced by a hostile target's
+# nameserver, so capture() re-checks response.server_addr() once Chromium has
+# actually connected, and must not let a rebound response's content (title,
+# text, screenshot) flow downstream if that check fails.
+# --------------------------------------------------------------------------- #
+
+
+class FakeResponse:
+    def __init__(self, status, url, remote_ip):
+        self.status = status
+        self.url = url
+        self._remote_ip = remote_ip
+
+    async def server_addr(self):
+        if self._remote_ip is None:
+            return None
+        return {"ipAddress": self._remote_ip, "port": 443}
+
+
+class FakeCapturePage:
+    """Minimal stand-in for a Playwright Page, enough to drive capture()."""
+
+    def __init__(self, response, page_url="https://example.com/"):
+        self._response = response
+        self.url = page_url
+        self.closed = False
+        self.routes = []
+
+    def on(self, event, callback):
+        pass
+
+    async def route(self, pattern, handler):
+        self.routes.append((pattern, handler))
+
+    async def goto(self, url, wait_until=None, timeout=None):
+        return self._response
+
+    async def wait_for_timeout(self, ms):
+        pass
+
+    async def title(self):
+        return "Real page title"
+
+    async def inner_text(self, selector):
+        return "real page body text"
+
+    async def evaluate(self, script):
+        return 100
+
+    async def screenshot(self, **kwargs):
+        pass
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeCaptureContext:
+    def __init__(self, page):
+        self._page = page
+
+    async def new_page(self):
+        return self._page
+
+
+def make_bare_capturer(tmp_path, page, **option_overrides) -> BrowserCapturer:
+    """A BrowserCapturer wired to a fake context, bypassing __aenter__ (which
+    launches a real Chromium)."""
+    capturer = BrowserCapturer(CaptureOptions(**option_overrides), tmp_path)
+    capturer._context = FakeCaptureContext(page)
+    capturer._screenshot_lock = asyncio.Lock()
+    return capturer
+
+
+def test_capture_blocks_a_dns_rebound_response_from_a_public_host(tmp_path):
+    # The pre-connect guard's DNS lookup for evil.example allowed this
+    # navigation (it saw a public IP); Chromium's own, later lookup landed
+    # on the metadata address instead — exactly the rebind this closer
+    # exists for.
+    response = FakeResponse(200, "https://evil.example/", "169.254.169.254")
+    page = FakeCapturePage(response, page_url="https://evil.example/")
+    capturer = make_bare_capturer(tmp_path, page)
+
+    capture = run(capturer.capture("https://monitored.example/"))
+
+    assert capture.load_error is not None
+    assert "disallowed" in capture.load_error
+    assert capture.title is None
+    assert capture.text_excerpt == ""
+    assert capture.screenshot_path is None
+    assert capture.ok is False
+    assert page.closed is True
+
+
+def test_capture_allows_a_response_from_a_public_address(tmp_path):
+    response = FakeResponse(200, "https://monitored.example/", "93.184.216.34")
+    page = FakeCapturePage(response, page_url="https://monitored.example/")
+    capturer = make_bare_capturer(tmp_path, page)
+
+    capture = run(capturer.capture("https://monitored.example/"))
+
+    assert capture.load_error is None
+    assert capture.title == "Real page title"
+    assert capture.text_excerpt == "real page body text"
+    assert capture.screenshot_path is not None
+
+
+def test_capture_never_blocks_the_operators_own_target_even_if_private(tmp_path):
+    # Same-host exemption: an operator scanning a deliberately internal
+    # target must not have their own result blocked by this check.
+    response = FakeResponse(200, "https://monitored.example/", "10.0.0.5")
+    page = FakeCapturePage(response, page_url="https://monitored.example/")
+    capturer = make_bare_capturer(tmp_path, page)
+
+    capture = run(capturer.capture("https://monitored.example/"))
+
+    assert capture.load_error is None
+    assert capture.title == "Real page title"
+
+
+def test_capture_post_connect_check_skipped_when_guard_disabled(tmp_path):
+    response = FakeResponse(200, "https://evil.example/", "169.254.169.254")
+    page = FakeCapturePage(response, page_url="https://evil.example/")
+    capturer = make_bare_capturer(tmp_path, page, block_private_redirects=False)
+
+    capture = run(capturer.capture("https://monitored.example/"))
+
+    assert capture.load_error is None
+    assert capture.title == "Real page title"

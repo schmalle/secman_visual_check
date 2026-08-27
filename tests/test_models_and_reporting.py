@@ -553,6 +553,7 @@ def make_report_with_secret(secret: str = SECRET) -> ScanReport:
         risk_level=Severity.LOW,
         summary=f"The page reflected the credential {secret} back in its body.",
         page_type=f"error page mentioning {secret}",
+        raw_response=f'{{"summary": "reflected {secret} in body"}}',
         findings=[
             Finding(
                 category=f"leaked_{secret}",
@@ -599,6 +600,7 @@ def test_redact_report_scrubs_every_target_influenced_text_field():
     assert SECRET not in result.status_check.error
     assert SECRET not in result.analysis.summary
     assert SECRET not in result.analysis.page_type
+    assert SECRET not in (result.analysis.raw_response or "")
     assert SECRET not in result.analysis.findings[0].category
     assert SECRET not in result.analysis.findings[0].title
     assert SECRET not in result.analysis.findings[0].evidence
@@ -628,6 +630,23 @@ def test_json_report_redacts_a_reflected_secret(tmp_path):
 
     assert SECRET not in text
     assert "<redacted>" in text
+
+
+def test_json_report_with_include_raw_still_redacts_a_reflected_secret(tmp_path):
+    """A resolved credential reflected back by a hostile/misbehaving target can
+    end up quoted verbatim in the model's raw reply (Analysis.raw_response).
+    --include-raw must not bypass redaction for that field."""
+    path = write_json_report(
+        make_report_with_secret(),
+        tmp_path / "raw.json",
+        secrets=[SECRET],
+        include_raw=True,
+    )
+    text = path.read_text(encoding="utf-8")
+
+    assert SECRET not in text
+    data = json.loads(text)
+    assert SECRET not in data["results"][0]["analysis"]["raw_response"]
 
 
 def test_json_report_without_secrets_is_unaffected(tmp_path):
