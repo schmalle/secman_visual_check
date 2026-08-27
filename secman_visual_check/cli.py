@@ -1058,16 +1058,27 @@ def _run_secman_upload(
     return EXIT_OK
 
 
-def _progress_hook(quiet: bool):
+def _progress_hook(quiet: bool, secrets: Sequence[str] = ()):
+    """Build the per-target progress line printed as the scan runs.
+
+    ``result.error`` and ``capture.load_error`` can carry text a scanned
+    target controls (a rejected-credential provider error, a page that
+    quotes back the headers it received) — the exact same fields
+    ``reporting.redact_report`` scrubs before any report is written. This
+    line is printed live, before that redaction ever runs, so it needs its
+    own pass through :func:`redact` or a resolved secret reflected back by a
+    target reaches stderr in the clear.
+    """
+
     def hook(result: ScanResult, done: int, total: int) -> None:
         if quiet:
             return
         if result.skipped_reason:
             state = f"skipped ({result.skipped_reason})"
         elif result.error:
-            state = f"error: {result.error}"
+            state = f"error: {redact(result.error, secrets)}"
         elif result.capture and result.capture.load_error:
-            state = f"load failed: {result.capture.load_error}"
+            state = f"load failed: {redact(result.capture.load_error, secrets)}"
         else:
             state = result.max_severity.value
         prefix = f"{result.status_check.label} | " if result.status_check else ""
@@ -1223,7 +1234,7 @@ def main(argv: list[str] | None = None) -> int:
             run_scan(
                 targets,
                 config,
-                progress=_progress_hook(args.quiet),
+                progress=_progress_hook(args.quiet, resolver.values),
                 tool_version=__version__,
             )
         )
