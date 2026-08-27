@@ -142,7 +142,7 @@ def test_robots_disallow_skips_the_target(patched, tmp_path, monkeypatch):
         async def allowed(self, url):
             return "allowed" in url
 
-    monkeypatch.setattr(scanner, "RobotsCache", lambda: DenyAll())
+    monkeypatch.setattr(scanner, "RobotsCache", lambda **kwargs: DenyAll())
     targets = ["https://allowed.example/", "https://denied.example/"]
     report = asyncio.run(
         scanner.run_scan(targets, make_config(tmp_path, respect_robots=True))
@@ -203,7 +203,7 @@ def test_a_robots_skipped_target_is_never_touched_by_the_status_check(
         async def allowed(self, url):
             return "allowed" in url
 
-    monkeypatch.setattr(scanner, "RobotsCache", lambda: DenyAll())
+    monkeypatch.setattr(scanner, "RobotsCache", lambda **kwargs: DenyAll())
     targets = ["https://allowed.example/", "https://denied.example/"]
     report = asyncio.run(
         scanner.run_scan(targets, make_config(tmp_path, respect_robots=True))
