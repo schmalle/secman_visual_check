@@ -40,9 +40,20 @@ def normalize_url(raw: str) -> str:
         raise TargetError(f"missing host in {raw!r}")
 
     path = parsed.path or "/"
-    return urlunparse(
-        (parsed.scheme.lower(), parsed.netloc, path, parsed.params, parsed.query, "")
-    )
+    # Drop any embedded userinfo (``user:pass@host``). This tool never reads
+    # credentials out of the URL for authentication — the only supported
+    # mechanism is ``--basic-auth`` (see capture.py/status.py), which is
+    # resolved through secrets.py and redacted like any other credential — so
+    # a `user:pass@` prefix typed into a target URL is pure liability: it
+    # would ride untouched as the *structural* `url` field into every report,
+    # the mailer, and (via `--secman-register-assets`) into SecMan's own
+    # asset inventory as the `uri` field, none of which redact URLs (redact()
+    # only scrubs *resolved* secrets it was told about, and structural fields
+    # are deliberately left alone otherwise — see reporting.py). Stripping it
+    # here, once, at the single choke point every target passes through,
+    # closes that leak without changing any documented behaviour.
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunparse((parsed.scheme.lower(), netloc, path, parsed.params, parsed.query, ""))
 
 
 def parse_target_lines(lines: Iterable[str]) -> tuple[list[str], list[str]]:
