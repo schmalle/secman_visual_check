@@ -135,6 +135,14 @@ def _redact_analysis(analysis: Analysis | None, secrets: Sequence[str]) -> Analy
         error=_redact_or_none(analysis.error, secrets),
         raw_response=_redact_or_none(analysis.raw_response, secrets),
         findings=[_redact_finding(f, secrets) for f in analysis.findings],
+        # The model's raw completion text is exactly as target-influenced as
+        # `summary`/`findings` — it is parsed *into* those fields — but is
+        # kept verbatim on `Analysis.raw_response` for `--include-raw`. Left
+        # unredacted here, a resolved credential the model echoed back (e.g.
+        # while quoting a rejected Basic-Auth error page) would still reach
+        # the JSON report whenever `--include-raw` is used, defeating the
+        # redaction every other field in this dataclass already gets.
+        raw_response=_redact_or_none(analysis.raw_response, secrets),
     )
 
 
