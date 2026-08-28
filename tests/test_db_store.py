@@ -310,6 +310,24 @@ def test_from_url_rejects_a_foreign_scheme():
         DbOptions.from_url("postgres://user@host/db")
 
 
+def test_from_url_error_never_echoes_the_credentials_in_a_malformed_dsn():
+    """``url`` is frequently a secret just resolved from a ``pass://``
+    reference (see ``--db-url``): the whole DSN, credentials included, is
+    exactly what an operator puts behind a reference to keep it off argv and
+    logs. A missing-scheme paste mistake (e.g. the leading ``mysql://`` was
+    dropped) must not turn right around and print those credentials in the
+    exception raised for it — that exception is printed unredacted by the
+    CLI's early option-validation error handler."""
+    malformed = "//scanner:s3cret@db.internal:3306/results"
+
+    with pytest.raises(ValueError) as excinfo:
+        DbOptions.from_url(malformed)
+
+    message = str(excinfo.value)
+    assert "s3cret" not in message
+    assert malformed not in message
+
+
 def test_the_password_appears_neither_in_the_dsn_nor_in_the_printed_report():
     parsed = DbOptions.from_url(
         "mysql://scanner:s3cret@db.internal:3306/results", enabled=True

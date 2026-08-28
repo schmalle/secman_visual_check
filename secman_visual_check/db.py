@@ -78,11 +78,23 @@ class DbOptions:
 
     @classmethod
     def from_url(cls, url: str, **overrides: Any) -> "DbOptions":
-        """Parse ``mysql://user:pass@host:3306/dbname``."""
+        """Parse ``mysql://user:pass@host:3306/dbname``.
+
+        ``url`` is frequently a secret just resolved from a ``pass://``
+        reference (see the ``--db-url`` docstring in ``cli.py``): the whole
+        DSN, credentials included, is exactly what an operator puts behind a
+        reference to keep it off the command line and out of logs. A
+        malformed value (missing the ``mysql://``/``mariadb://` prefix — an
+        easy paste mistake) must never echo that value back in the
+        exception: the message reaching argparse's caller, and from there
+        stderr/CI logs, must describe the problem without repeating the
+        credentials that caused it.
+        """
         parts = urlsplit(url)
         if parts.scheme not in ("mysql", "mariadb"):
+            described = parts.scheme or "no scheme"
             raise ValueError(
-                f"--db-url must start with mysql:// or mariadb://, got {parts.scheme or url!r}"
+                f"--db-url must start with mysql:// or mariadb:// (got {described!r})"
             )
         if not parts.hostname:
             raise ValueError("--db-url is missing a host")
