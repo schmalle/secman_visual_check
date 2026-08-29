@@ -449,23 +449,34 @@ class FakeResponse:
 class FakeCapturePage:
     """Minimal stand-in for a Playwright Page, enough to drive capture()."""
 
-    def __init__(self, response, page_url="https://example.com/"):
+    def __init__(self, response, page_url="https://example.com/", subresource_response=None):
         self._response = response
         self.url = page_url
         self.closed = False
         self.routes = []
+        self._response_handlers = []
+        # A response capture() never navigated to itself — a subresource
+        # fetch/XHR the page's own JS issued — fired once the page settles,
+        # matching how Playwright's "response" event arrives asynchronously
+        # after goto() rather than as part of it.
+        self._subresource_response = subresource_response
 
     def on(self, event, callback):
-        pass
+        if event == "response":
+            self._response_handlers.append(callback)
 
     async def route(self, pattern, handler):
         self.routes.append((pattern, handler))
 
     async def goto(self, url, wait_until=None, timeout=None):
+        for handler in self._response_handlers:
+            await handler(self._response)
         return self._response
 
     async def wait_for_timeout(self, ms):
-        pass
+        if self._subresource_response is not None:
+            for handler in self._response_handlers:
+                await handler(self._subresource_response)
 
     async def title(self):
         return "Real page title"
@@ -549,6 +560,75 @@ def test_capture_never_blocks_the_operators_own_target_even_if_private(tmp_path)
 def test_capture_post_connect_check_skipped_when_guard_disabled(tmp_path):
     response = FakeResponse(200, "https://evil.example/", "169.254.169.254")
     page = FakeCapturePage(response, page_url="https://evil.example/")
+    capturer = make_bare_capturer(tmp_path, page, block_private_redirects=False)
+
+    capture = run(capturer.capture("https://monitored.example/"))
+
+    assert capture.load_error is None
+    assert capture.title == "Real page title"
+
+
+# --------------------------------------------------------------------------- #
+# Subresource post-connect check: a scanned page's own fetch()/XHR to a
+# cross-origin URL is intercepted pre-connect by the same is_unsafe_redirect()
+# call the main navigation route handler uses (see _make_secure_route_handler),
+# but that check races Chromium's own DNS resolution exactly like the main
+# navigation's did — same DNS-rebinding TOCTOU, different request. capture()
+# now listens for every "response" the page receives, not just the one
+# page.goto() itself returns, and blocks the whole capture's derived content
+# if any of them turns out to have rebound post-connect.
+# --------------------------------------------------------------------------- #
+
+
+def test_capture_blocks_on_a_rebound_subresource_even_though_the_main_page_is_clean(tmp_path):
+    main_response = FakeResponse(200, "https://monitored.example/", "93.184.216.34")
+    # The page's own JS fetched this cross-origin URL; the pre-connect guard's
+    # DNS lookup allowed it (saw a public IP) but Chromium's own, later
+    # connection landed on cloud metadata instead.
+    subresource_response = FakeResponse(200, "https://evil.example/api", "169.254.169.254")
+    page = FakeCapturePage(
+        main_response,
+        page_url="https://monitored.example/",
+        subresource_response=subresource_response,
+    )
+    capturer = make_bare_capturer(tmp_path, page)
+
+    capture = run(capturer.capture("https://monitored.example/"))
+
+    assert capture.load_error is not None
+    assert "disallowed" in capture.load_error
+    assert capture.title is None
+    assert capture.text_excerpt == ""
+    assert capture.screenshot_path is None
+    assert capture.ok is False
+    assert page.closed is True
+
+
+def test_capture_allows_a_page_whose_subresources_are_all_public(tmp_path):
+    main_response = FakeResponse(200, "https://monitored.example/", "93.184.216.34")
+    subresource_response = FakeResponse(200, "https://cdn.example/lib.js", "93.184.216.35")
+    page = FakeCapturePage(
+        main_response,
+        page_url="https://monitored.example/",
+        subresource_response=subresource_response,
+    )
+    capturer = make_bare_capturer(tmp_path, page)
+
+    capture = run(capturer.capture("https://monitored.example/"))
+
+    assert capture.load_error is None
+    assert capture.title == "Real page title"
+    assert capture.text_excerpt == "real page body text"
+
+
+def test_capture_subresource_check_skipped_when_guard_disabled(tmp_path):
+    main_response = FakeResponse(200, "https://monitored.example/", "93.184.216.34")
+    subresource_response = FakeResponse(200, "https://evil.example/api", "169.254.169.254")
+    page = FakeCapturePage(
+        main_response,
+        page_url="https://monitored.example/",
+        subresource_response=subresource_response,
+    )
     capturer = make_bare_capturer(tmp_path, page, block_private_redirects=False)
 
     capture = run(capturer.capture("https://monitored.example/"))

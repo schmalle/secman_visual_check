@@ -16,6 +16,7 @@ from .models import (
     Analysis,
     Finding,
     PageCapture,
+    RedirectHop,
     ScanReport,
     ScanResult,
     Severity,
@@ -109,10 +110,26 @@ def _redact_capture(capture: PageCapture | None, secrets: Sequence[str]) -> Page
     )
 
 
+def _redact_hop(hop: RedirectHop, secrets: Sequence[str]) -> RedirectHop:
+    # ``location`` is a raw Location header, verbatim from the target — same
+    # reflection channel as status.error/capture.text_excerpt, just easy to
+    # miss because it reads as structural chain data rather than target
+    # content. A same-host target that reads its own incoming Authorization
+    # header (--basic-auth) can put the decoded value straight into a
+    # Location header of its next response; unredacted, that value would
+    # flow into every report format's rendered chain (see _write_status_line
+    # and the HTML status-chain renderer) as well as the raw JSON.
+    return replace(hop, location=_redact_or_none(hop.location, secrets))
+
+
 def _redact_status(status: UrlStatus | None, secrets: Sequence[str]) -> UrlStatus | None:
     if status is None:
         return None
-    return replace(status, error=_redact_or_none(status.error, secrets))
+    return replace(
+        status,
+        error=_redact_or_none(status.error, secrets),
+        chain=[_redact_hop(hop, secrets) for hop in status.chain],
+    )
 
 
 def _redact_finding(finding: Finding, secrets: Sequence[str]) -> Finding:

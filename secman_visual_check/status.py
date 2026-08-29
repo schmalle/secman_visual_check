@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlsplit
 
 from .capture import CaptureOptions
 from .models import RedirectHop, UrlStatus, utcnow
-from .ssrf_guard import is_unsafe_redirect
+from .ssrf_guard import is_unsafe_connected_addr, is_unsafe_redirect
 
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_MAX_REDIRECTS = 10
@@ -172,7 +172,7 @@ class UrlStatusChecker:
         try:
             while True:
                 hop_started = time.monotonic()
-                response, used_method = await self._request(method, current, original_host)
+                response, used_method, remote_ip = await self._request(method, current, original_host)
                 hop = RedirectHop(
                     url=current,
                     status=response.status_code,
@@ -183,6 +183,29 @@ class UrlStatusChecker:
                 if status.first_status is None:
                     status.first_status = hop.status
                     status.method = used_method
+
+                if options.block_private_redirects and is_unsafe_connected_addr(
+                    url, current, remote_ip
+                ):
+                    # is_unsafe_redirect() below vets a redirect's *target* before
+                    # we connect to it, from this process's own DNS lookup — which
+                    # a hostile target's nameserver can answer differently than
+                    # the one httpx's own, independent resolution used moments
+                    # later for the actual connection (DNS-rebinding TOCTOU).
+                    # remote_ip is the address httpx *actually* connected to for
+                    # *this* hop, read while the stream was still open (see
+                    # ssrf_guard.is_unsafe_connected_addr and `_connected_ip`
+                    # below); nothing left to race. Deliberately checked before
+                    # final_status/final_url are updated below, so a rebound
+                    # response — even a 200 — never becomes the walk's trusted
+                    # answer or feeds `status.ok`.
+                    status.state = "redirect_broken"
+                    status.error = (
+                        "blocked: response served from a disallowed private/"
+                        "internal address (post-connect SSRF check)"
+                    )
+                    break
+
                 status.final_status = hop.status
                 status.final_url = current
 
@@ -242,12 +265,12 @@ class UrlStatusChecker:
         # Only worth a body fetch once we know the target answered as asked: a
         # 404's error page changes for reasons nobody wants to be alerted about.
         if options.checksum and status.ok and status.final_url:
-            await self._add_checksum(status, original_host)
+            await self._add_checksum(status, original_host, url)
 
         status.elapsed_s = time.monotonic() - started
         return status
 
-    async def _add_checksum(self, status: UrlStatus, original_host: str) -> None:
+    async def _add_checksum(self, status: UrlStatus, original_host: str, original_url: str) -> None:
         """Hash the body of the final response, up to the size cap."""
         import httpx
 
@@ -260,6 +283,18 @@ class UrlStatusChecker:
 
         try:
             async with client.stream("GET", status.final_url, **scoped) as response:
+                # This is a brand-new connection, separate from whichever hop
+                # in the redirect walk above landed on status.final_url — a
+                # DNS-rebinding nameserver gets a fresh chance to answer this
+                # lookup differently than it answered the walk's. Same
+                # post-connect closer as the walk, applied to this fetch's own
+                # connection (see ssrf_guard.is_unsafe_connected_addr).
+                if self.options.block_private_redirects and is_unsafe_connected_addr(
+                    original_url, status.final_url, _connected_ip(response)
+                ):
+                    status.content_type = None
+                    _append_error(status, "checksum unavailable: blocked (post-connect SSRF check)")
+                    return
                 status.content_type = response.headers.get("content-type")
                 if response.status_code not in status.expected_statuses:
                     # The target changed answer between the walk and this fetch.
@@ -295,33 +330,64 @@ class UrlStatusChecker:
         status.content_length = size
 
     async def _request(self, method: str, url: str, original_host: str):
-        """One hop. Returns ``(response, method_used)``.
+        """One hop. Returns ``(response, method_used, remote_ip)``.
 
         A GET is streamed and abandoned once the headers land, so a status check
         never downloads a body — the point is the status line, not the page.
+        Both HEAD and GET go through :meth:`_stream` (never a bare
+        ``client.head()``/``client.get()``) so ``remote_ip`` — the address the
+        connection actually used — can be read while it is still open; see
+        ``_connected_ip``.
         """
-        client = self._client
-        assert client is not None
-        scoped = self._scoped_kwargs(url, original_host)
-
         if method == "HEAD":
-            response = await client.head(url, **scoped)
+            response, remote_ip = await self._stream("HEAD", url, original_host)
             if self.options.method == "auto" and response.status_code in _HEAD_UNSUPPORTED:
-                return await self._stream_get(url, original_host), "GET"
-            return response, "HEAD"
-        return await self._stream_get(url, original_host), "GET"
+                response, remote_ip = await self._stream("GET", url, original_host)
+                return response, "GET", remote_ip
+            return response, "HEAD", remote_ip
+        response, remote_ip = await self._stream("GET", url, original_host)
+        return response, "GET", remote_ip
 
-    async def _stream_get(self, url: str, original_host: str):
-        """A GET whose body is never read.
+    async def _stream(self, http_method: str, url: str, original_host: str):
+        """Send one request whose body is never read. Returns ``(response,
+        remote_ip)``.
 
-        The response is closed on the way out of the ``with``; only the status
-        line and headers are touched afterwards, and those survive closing.
+        The response is closed on the way out of the ``with``; the status line
+        and headers are touched afterwards and survive that, but a stream's
+        ``network_stream`` extra info does not — httpx releases the underlying
+        connection back to the pool once the block exits, and a released
+        connection reports no ``server_addr``. ``remote_ip`` is therefore
+        captured here, before exit, not by the caller.
         """
         client = self._client
         assert client is not None
         scoped = self._scoped_kwargs(url, original_host)
-        async with client.stream("GET", url, **scoped) as response:
-            return response
+        async with client.stream(http_method, url, **scoped) as response:
+            return response, _connected_ip(response)
+
+
+def _connected_ip(response) -> str | None:
+    """The address a stream's connection actually used, read while the
+    stream that produced ``response`` is still open.
+
+    httpx exposes this via ``response.extensions["network_stream"]`` — but
+    only until the connection is released back to the pool, which happens the
+    moment a ``client.stream(...)`` block exits (or a non-streaming call like
+    ``client.head()``/``client.get()`` returns). Callers must therefore call
+    this from *inside* the ``async with client.stream(...)`` block, same as
+    capture.py reads Chromium's ``response.server_addr()`` right after
+    ``page.goto()`` returns. See ssrf_guard.is_unsafe_connected_addr.
+    """
+    network_stream = response.extensions.get("network_stream")
+    if network_stream is None:
+        return None
+    try:
+        addr = network_stream.get_extra_info("server_addr")
+    except Exception:  # pragma: no cover - backend-specific, best effort
+        return None
+    if not addr:
+        return None
+    return addr[0]
 
 
 def _classify(status: UrlStatus) -> str:

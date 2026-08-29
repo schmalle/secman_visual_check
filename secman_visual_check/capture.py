@@ -294,6 +294,29 @@ class BrowserCapturer:
                 ),
             )
 
+        # DNS-rebinding closer for *every* response this page receives, not just
+        # the main navigation: is_unsafe_redirect() in the route handler above
+        # already vetted each request's target before Chromium connected, from
+        # this process's own DNS lookup — which a malicious target's nameserver
+        # can race against Chromium's independent lookup moments later. A
+        # subresource fetch (``fetch()``, XHR, a beacon) that lands on a blocked
+        # address post-connect is exactly as dangerous as the main response
+        # rebinding: its content can end up written into the DOM, and from there
+        # into text_excerpt, the screenshot, or the AI analyzer. There is no way
+        # to retroactively scrub only that one subresource's contribution once
+        # this fires, so — like the main-response check — any rebind found this
+        # way blocks the whole capture's derived content.
+        rebind_detected = False
+
+        async def on_response(response):
+            nonlocal rebind_detected
+            if not options.block_private_redirects or rebind_detected:
+                return
+            if await _response_is_unsafe(url, response):
+                rebind_detected = True
+
+        page.on("response", on_response)
+
         blocked_post_connect = False
         try:
             try:
@@ -304,23 +327,15 @@ class BrowserCapturer:
                 )
                 if response is not None:
                     capture.status = response.status
-                    if options.block_private_redirects:
-                        # DNS-rebinding closer: is_unsafe_redirect()/is_unsafe_destination()
-                        # already vetted this navigation before Chromium connected, from
-                        # this process's own DNS lookup — which a malicious target's
-                        # nameserver can race against Chromium's independent lookup
-                        # moments later. Re-check the address Chromium *actually*
-                        # connected to; if that's a rebind onto a blocked address, the
-                        # page's content must not flow into text_excerpt, the
-                        # screenshot, or the AI analyzer (see ssrf_guard.is_unsafe_connected_addr).
-                        remote = await _safe(response.server_addr)
-                        remote_ip = remote.get("ipAddress") if remote else None
-                        if is_unsafe_connected_addr(url, response.url, remote_ip):
-                            blocked_post_connect = True
-                            capture.load_error = (
-                                "blocked: response served from a disallowed private/"
-                                "internal address (post-connect SSRF check)"
-                            )
+                    if options.block_private_redirects and await _response_is_unsafe(url, response):
+                        # Same closer as above, checked explicitly for the main
+                        # response too so its own load_error is specific (see
+                        # ssrf_guard.is_unsafe_connected_addr).
+                        blocked_post_connect = True
+                        capture.load_error = (
+                            "blocked: response served from a disallowed private/"
+                            "internal address (post-connect SSRF check)"
+                        )
             except PlaywrightError as exc:
                 # Keep going: a timed-out page often still has renderable content.
                 capture.load_error = _short_error(exc)
@@ -329,6 +344,14 @@ class BrowserCapturer:
                 await page.wait_for_timeout(options.settle_ms)
 
             capture.final_url = page.url
+
+            if rebind_detected and not blocked_post_connect:
+                blocked_post_connect = True
+                if capture.load_error is None:
+                    capture.load_error = (
+                        "blocked: a subresource response was served from a "
+                        "disallowed private/internal address (post-connect SSRF check)"
+                    )
 
             if blocked_post_connect:
                 return capture
@@ -400,6 +423,20 @@ async def _safe(fn):
         return await fn()
     except Exception:
         return None
+
+
+async def _response_is_unsafe(original_url: str, response) -> bool:
+    """True if a completed Playwright response should be blocked as a
+    DNS-rebinding SSRF hop, after the fact.
+
+    Shared by the main-navigation check and the per-response listener in
+    ``capture()``: both need the same "what did Chromium actually connect
+    to" re-check (``response.server_addr()``), just at different points in a
+    page's lifecycle. See ssrf_guard.is_unsafe_connected_addr.
+    """
+    remote = await _safe(response.server_addr)
+    remote_ip = remote.get("ipAddress") if remote else None
+    return is_unsafe_connected_addr(original_url, response.url, remote_ip)
 
 
 def _truncate(text: str, limit: int) -> str:

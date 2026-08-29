@@ -570,6 +570,15 @@ def make_report_with_secret(secret: str = SECRET) -> ScanReport:
         first_status=401,
         final_status=401,
         error=f"HTTP 401: {secret}",
+        # A same-host target can read its own incoming Authorization header
+        # (--basic-auth) and put the decoded value straight into a Location
+        # header of its next response — a reflection channel just like the
+        # text fields above, easy to miss because it looks like structural
+        # chain data rather than target-influenced content.
+        chain=[
+            RedirectHop(url="https://example.com/", status=302, location=f"/next?leaked={secret}"),
+            RedirectHop(url="https://example.com/next", status=401),
+        ],
     )
     report = ScanReport(model="test/model", tool_version="0.2.0")
     report.results = [
@@ -598,6 +607,7 @@ def test_redact_report_scrubs_every_target_influenced_text_field():
     assert SECRET not in result.capture.load_error
     assert SECRET not in result.capture.console_errors[0]
     assert SECRET not in result.status_check.error
+    assert SECRET not in result.status_check.chain[0].location
     assert SECRET not in result.analysis.summary
     assert SECRET not in result.analysis.page_type
     assert SECRET not in (result.analysis.raw_response or "")
