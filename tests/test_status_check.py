@@ -5,6 +5,7 @@ import asyncio
 import httpx
 import pytest
 
+import secman_visual_check.status as status_module
 from secman_visual_check.capture import CaptureOptions
 from secman_visual_check.status import StatusCheckOptions, UrlStatusChecker
 
@@ -191,6 +192,119 @@ def test_redirect_within_the_same_host_is_never_blocked_regardless_of_address():
 
     assert status.state == "redirect"
     assert status.ok is True
+
+
+# --------------------------------------------------------------------------- #
+# Post-connect DNS-rebinding closer (ssrf_guard.is_unsafe_connected_addr).
+#
+# is_unsafe_redirect() above decides from *this process's* own DNS lookup of a
+# redirect target before the walk follows it; a hostile target's nameserver
+# can answer httpx's own, independent lookup for the actual connection
+# differently moments later (TTL-0 rebinding), landing the real request on a
+# private/internal address the pre-connect guard never saw. `_connected_ip`
+# reads the address a stream's connection actually used — real network I/O
+# httpx.MockTransport does not perform, so these tests monkeypatch it the same
+# way test_capture.py fakes response.server_addr() for the browser side of
+# this same closer.
+# --------------------------------------------------------------------------- #
+
+
+def test_post_connect_check_blocks_a_rebound_response_after_a_redirect(monkeypatch):
+    # The pre-connect guard's DNS lookup for other-public-site.example allowed
+    # this redirect (it is unresolvable in this test environment, which is
+    # treated as "not blocked" — see test_unresolvable_host_is_not_treated_as_
+    # unsafe); httpx's own, later connection is made to lands on the metadata
+    # address instead, exactly the rebind this closer exists for.
+    def fake_connected_ip(response):
+        return "169.254.169.254" if response.request.url.host == "other-public-site.example" else "93.184.216.34"
+
+    monkeypatch.setattr(status_module, "_connected_ip", fake_connected_ip)
+
+    status = run_check(
+        responder(
+            {
+                "https://example.com/": (302, "https://other-public-site.example/"),
+                "https://other-public-site.example/": (200, None),
+            }
+        ),
+        checksum=False,
+    )
+
+    assert status.state == "redirect_broken"
+    assert status.ok is False
+    assert "blocked" in status.error
+    assert "post-connect" in status.error
+    # The rebound 200 must never become the walk's trusted answer.
+    assert status.final_status == 302
+
+
+def test_post_connect_check_allows_a_response_from_a_public_address(monkeypatch):
+    monkeypatch.setattr(status_module, "_connected_ip", lambda response: "93.184.216.34")
+
+    status = run_check(responder({"https://example.com/": (200, None)}), checksum=False)
+
+    assert status.state == "ok"
+    assert status.ok is True
+
+
+def test_post_connect_check_never_blocks_the_operators_own_target_even_if_private(monkeypatch):
+    # Same same-host exemption as is_unsafe_redirect: the operator's own
+    # target is never blocked, whatever address it actually connects to.
+    monkeypatch.setattr(status_module, "_connected_ip", lambda response: "127.0.0.1")
+
+    status = run_check(responder({"https://example.com/": (200, None)}), checksum=False)
+
+    assert status.state == "ok"
+    assert status.ok is True
+
+
+def test_post_connect_check_skipped_when_guard_disabled(monkeypatch):
+    monkeypatch.setattr(status_module, "_connected_ip", lambda response: "169.254.169.254")
+
+    status = run_check(
+        responder(
+            {
+                "https://example.com/": (302, "https://other-public-site.example/"),
+                "https://other-public-site.example/": (200, None),
+            }
+        ),
+        checksum=False,
+        block_private_redirects=False,
+    )
+
+    assert status.state == "redirect"
+    assert status.ok is True
+
+
+def test_post_connect_check_also_guards_the_checksum_fetchs_own_connection(monkeypatch):
+    # The checksum stage opens a brand-new connection to status.final_url,
+    # separate from whichever hop in the walk landed there — a DNS-rebinding
+    # nameserver gets a fresh chance to answer *that* lookup unsafely, even
+    # when the walk's own connection to the very same URL was clean.
+    calls = {"n": 0}
+
+    def fake_connected_ip(response):
+        calls["n"] += 1
+        # Call 1: the walk's own GET to example.com (same-host exempt either
+        # way). Call 2: the walk's own GET landing on other-public-site.example
+        # (clean). Call 3: the checksum stage's *separate* GET to that same
+        # URL — rebound.
+        return "169.254.169.254" if calls["n"] == 3 else "93.184.216.34"
+
+    monkeypatch.setattr(status_module, "_connected_ip", fake_connected_ip)
+
+    def handler(request):
+        if str(request.url) == "https://example.com/":
+            return httpx.Response(302, headers={"Location": "https://other-public-site.example/"})
+        return httpx.Response(200, content=b"<h1>hi</h1>")
+
+    status = run_check(handler, method="get", checksum=True)
+
+    assert status.state == "redirect"  # the walk's own verdict is untouched
+    assert status.ok is True
+    assert status.content_checksum is None
+    assert "checksum unavailable" in status.error
+    assert "post-connect" in status.error
 
 
 def test_basic_auth_and_custom_headers_do_not_reach_a_cross_host_redirect_target():
