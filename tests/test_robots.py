@@ -124,6 +124,72 @@ def test_redirect_guard_can_be_disabled():
     assert not run(cache.allowed("https://example.com/anything"))
 
 
+class _FakeNetworkStream:
+    """Stands in for httpx's ``network_stream`` extension: the real transport
+    exposes the actual connected peer address through ``get_extra_info``."""
+
+    def __init__(self, remote_ip: str) -> None:
+        self._remote_ip = remote_ip
+
+    def get_extra_info(self, info: str):
+        if info == "server_addr":
+            return (self._remote_ip, 443)
+        return None
+
+
+def test_a_dns_rebound_redirect_target_is_blocked_after_connecting(monkeypatch):
+    # The pre-connect guard's own DNS lookup for attacker.example saw a
+    # public address and let this redirect through; the real connection
+    # (mocked here via the network_stream extension) landed on cloud
+    # metadata instead — the DNS-rebinding TOCTOU the pre-connect check
+    # alone cannot close (the same gap status.py and capture.py already
+    # close for their own fetches).
+    async def _resolves_to_blocked_ip(host):
+        return False
+
+    monkeypatch.setattr(
+        "secman_visual_check.ssrf_guard._resolves_to_blocked_ip", _resolves_to_blocked_ip
+    )
+
+    def handler(request):
+        if str(request.url) == "https://example.com/robots.txt":
+            return httpx.Response(302, headers={"Location": "https://attacker.example/robots.txt"})
+        return httpx.Response(
+            200,
+            text="User-agent: *\nDisallow: /\n",
+            extensions={"network_stream": _FakeNetworkStream("169.254.169.254")},
+        )
+
+    cache = make_cache(handler)
+    assert run(cache.allowed("https://example.com/anything"))
+
+
+def test_a_response_from_its_own_public_address_is_not_blocked():
+    def handler(request):
+        return httpx.Response(
+            200,
+            text="User-agent: *\nDisallow: /blocked\n",
+            extensions={"network_stream": _FakeNetworkStream("93.184.216.34")},
+        )
+
+    cache = make_cache(handler)
+    assert not run(cache.allowed("https://example.com/blocked"))
+
+
+def test_the_operators_own_target_is_never_blocked_by_the_post_connect_check():
+    # Same-host exemption: the operator's own target host is never blocked
+    # by this check, whatever address it actually resolves to.
+    def handler(request):
+        return httpx.Response(
+            200,
+            text="User-agent: *\nDisallow: /blocked\n",
+            extensions={"network_stream": _FakeNetworkStream("127.0.0.1")},
+        )
+
+    cache = make_cache(handler)
+    assert not run(cache.allowed("https://example.com/blocked"))
+
+
 def test_redirect_loop_stops_and_fails_open():
     routes = {
         "https://example.com/robots.txt": (302, "https://example.com/a", ""),

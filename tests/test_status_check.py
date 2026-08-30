@@ -178,6 +178,125 @@ def test_redirect_to_a_private_address_can_be_allowed_explicitly():
     assert status.final_url == "http://10.0.0.5/"
 
 
+class _FakeNetworkStream:
+    """Stands in for httpx's ``network_stream`` extension: the real transport
+    exposes the actual connected peer address through ``get_extra_info``."""
+
+    def __init__(self, remote_ip: str) -> None:
+        self._remote_ip = remote_ip
+
+    def get_extra_info(self, info: str):
+        if info == "server_addr":
+            return (self._remote_ip, 443)
+        return None
+
+
+def test_a_dns_rebound_redirect_target_is_blocked_after_connecting(monkeypatch):
+    # The pre-connect guard's own DNS lookup for attacker.example saw a public
+    # address and let this redirect through; the real connection (mocked here
+    # via the network_stream extension) landed on cloud metadata instead —
+    # the DNS-rebinding TOCTOU the pre-connect check alone cannot close.
+    async def _resolves_to_blocked_ip(host):
+        return False
+
+    monkeypatch.setattr(
+        "secman_visual_check.ssrf_guard._resolves_to_blocked_ip", _resolves_to_blocked_ip
+    )
+
+    def handler(request):
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"Location": "https://attacker.example/"})
+        return httpx.Response(
+            200, extensions={"network_stream": _FakeNetworkStream("169.254.169.254")}
+        )
+
+    status = run_check(handler)
+
+    assert status.state == "unreachable"
+    assert status.error is not None
+    assert "post-connect SSRF check" in status.error
+    assert status.content_checksum is None
+
+
+def test_a_response_from_its_own_public_address_is_not_blocked():
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=b"hello",
+            extensions={"network_stream": _FakeNetworkStream("93.184.216.34")},
+        )
+
+    status = run_check(handler)
+
+    assert status.state == "ok"
+    assert status.content_checksum is not None
+
+
+def test_the_operators_own_target_is_never_blocked_by_the_post_connect_check():
+    # Same-host exemption, mirroring is_unsafe_redirect: the operator's own
+    # chosen target is never blocked by this check, whatever address it
+    # actually resolves to.
+    def handler(request):
+        return httpx.Response(
+            200, extensions={"network_stream": _FakeNetworkStream("127.0.0.1")}
+        )
+
+    status = run_check(handler)
+
+    assert status.state == "ok"
+
+
+def test_post_connect_check_is_skipped_when_the_guard_is_disabled(monkeypatch):
+    async def _resolves_to_blocked_ip(host):
+        return False
+
+    monkeypatch.setattr(
+        "secman_visual_check.ssrf_guard._resolves_to_blocked_ip", _resolves_to_blocked_ip
+    )
+
+    def handler(request):
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"Location": "https://attacker.example/"})
+        return httpx.Response(
+            200, extensions={"network_stream": _FakeNetworkStream("169.254.169.254")}
+        )
+
+    status = run_check(handler, block_private_redirects=False)
+
+    assert status.state == "redirect"
+
+
+def test_a_dns_rebound_checksum_fetch_is_reported_without_a_checksum(monkeypatch):
+    # The redirect hop itself connects to a public address (passing the
+    # walk's own post-connect check); the *separate* connection the checksum
+    # fetch opens for the same URL is the one that rebinds this time.
+    async def _resolves_to_blocked_ip(host):
+        return False
+
+    monkeypatch.setattr(
+        "secman_visual_check.ssrf_guard._resolves_to_blocked_ip", _resolves_to_blocked_ip
+    )
+
+    calls = {"n": 0}
+
+    def handler(request):
+        if request.url.host == "example.com":
+            return httpx.Response(302, headers={"Location": "https://attacker.example/"})
+        calls["n"] += 1
+        # First (HEAD/GET walk) call connects to a public address; the
+        # checksum fetch's own connection rebinds to metadata.
+        remote_ip = "93.184.216.34" if calls["n"] == 1 else "169.254.169.254"
+        return httpx.Response(
+            200, content=b"hello", extensions={"network_stream": _FakeNetworkStream(remote_ip)}
+        )
+
+    status = run_check(handler)
+
+    assert status.state == "redirect"  # the walk itself was not blocked
+    assert status.content_checksum is None
+    assert "post-connect SSRF check" in (status.error or "")
+
+
 def test_redirect_within_the_same_host_is_never_blocked_regardless_of_address():
     status = run_check(
         responder(

@@ -18,7 +18,7 @@ from urllib.parse import urljoin, urlsplit
 
 from .capture import CaptureOptions
 from .models import RedirectHop, UrlStatus, utcnow
-from .ssrf_guard import is_unsafe_redirect
+from .ssrf_guard import connected_ip, is_unsafe_connected_addr, is_unsafe_redirect
 
 DEFAULT_TIMEOUT_S = 15.0
 DEFAULT_MAX_REDIRECTS = 10
@@ -180,6 +180,26 @@ class UrlStatusChecker:
                     elapsed_s=time.monotonic() - hop_started,
                 )
                 status.chain.append(hop)
+
+                # DNS-rebinding closer, same shape as capture.py's post-connect
+                # check: is_unsafe_redirect() above vetted `current` from this
+                # process's own DNS lookup before the request was sent, which a
+                # malicious target's nameserver can answer differently than it
+                # answers httpx's own, independent lookup moments later. Check
+                # the address this hop's connection actually used; a rebind
+                # onto a blocked address stops the walk here, before its body
+                # is ever fetched for a checksum.
+                if options.block_private_redirects and is_unsafe_connected_addr(
+                    url, current, connected_ip(response)
+                ):
+                    status.state = "unreachable"
+                    status.error = (
+                        "blocked: response served from a disallowed private/"
+                        "internal address (post-connect SSRF check)"
+                    )
+                    status.elapsed_s = time.monotonic() - started
+                    return status
+
                 if status.first_status is None:
                     status.first_status = hop.status
                     status.method = used_method
@@ -265,6 +285,20 @@ class UrlStatusChecker:
                     # The target changed answer between the walk and this fetch.
                     status.content_type = None
                     return
+                # This fetch is its own fresh connection — the walk's own
+                # post-connect check (see _check) covers the hops it made,
+                # not this separate one — so it needs the same DNS-rebinding
+                # closer before the body is hashed into the report.
+                if self.options.block_private_redirects and is_unsafe_connected_addr(
+                    status.url, status.final_url, connected_ip(response)
+                ):
+                    status.content_type = None
+                    _append_error(
+                        status,
+                        "checksum unavailable: blocked, response served from a "
+                        "disallowed private/internal address (post-connect SSRF check)",
+                    )
+                    return
                 async for chunk in response.aiter_bytes():
                     if limit and size + len(chunk) > limit:
                         digest.update(chunk[: limit - size])
@@ -322,6 +356,7 @@ class UrlStatusChecker:
         scoped = self._scoped_kwargs(url, original_host)
         async with client.stream("GET", url, **scoped) as response:
             return response
+
 
 
 def _classify(status: UrlStatus) -> str:
