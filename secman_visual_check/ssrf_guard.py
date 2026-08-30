@@ -105,6 +105,38 @@ def is_unsafe_connected_addr(original_url: str, response_url: str, remote_ip: st
     return _is_blocked_ip(remote_ip)
 
 
+def connected_ip(response: object) -> str | None:
+    """The IP address a completed httpx response's connection actually used.
+
+    Read from the transport's own network stream (``response.extensions
+    ["network_stream"].get_extra_info("server_addr")``), never from a fresh
+    DNS lookup — a fresh lookup is exactly what a DNS-rebinding target could
+    answer differently from the connection that was really made, which is
+    the whole TOCTOU :func:`is_unsafe_connected_addr` exists to close.
+    Returns ``None`` whenever that information is not available (a mock
+    transport in tests, a proxy, a pooled connection whose socket has since
+    closed, or any other backend that does not expose it) — a caller passing
+    ``None`` through to :func:`is_unsafe_connected_addr` fails open, the same
+    way ``capture.py``'s own ``_safe(response.server_addr)`` does: this is a
+    defense-in-depth closer for a real client, not something correctness
+    depends on.
+    """
+    stream = (getattr(response, "extensions", None) or {}).get("network_stream")
+    get_extra_info = getattr(stream, "get_extra_info", None)
+    if get_extra_info is None:
+        return None
+    try:
+        addr = get_extra_info("server_addr")
+    except Exception:
+        return None
+    if not addr:
+        return None
+    try:
+        return str(addr[0])
+    except (TypeError, IndexError):
+        return None
+
+
 async def is_unsafe_destination(url: str) -> bool:
     """True if ``url``'s host is a private/loopback/link-local/reserved address.
 

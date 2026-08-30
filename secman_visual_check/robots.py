@@ -73,7 +73,7 @@ class RobotsCache:
         """
         import httpx
 
-        from .ssrf_guard import is_unsafe_redirect
+        from .ssrf_guard import connected_ip, is_unsafe_connected_addr, is_unsafe_redirect
 
         client = self._client
         owns_client = client is None
@@ -87,6 +87,19 @@ class RobotsCache:
                 try:
                     response = await client.get(current)
                 except Exception:
+                    return None
+
+                # DNS-rebinding closer, same shape as status.py's identical
+                # check: is_unsafe_redirect() below vets a redirect target
+                # from this process's own DNS lookup before requesting it,
+                # which a malicious target's nameserver can answer
+                # differently than it answers httpx's own, independent
+                # lookup moments later. A rebind onto a blocked address
+                # fails open (matches every other error path here) rather
+                # than parsing whatever body came back.
+                if self.block_private_redirects and is_unsafe_connected_addr(
+                    robots_url, current, connected_ip(response)
+                ):
                     return None
 
                 if response.status_code not in _REDIRECT_STATUSES:
