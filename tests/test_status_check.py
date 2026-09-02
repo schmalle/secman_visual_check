@@ -1,6 +1,7 @@
 """The HTTP status/redirect pre-check: the walk, the classification, the fallbacks."""
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -631,3 +632,76 @@ def test_checksum_appears_in_to_dict():
     assert payload["content_length"] == 4
     assert payload["content_type"] == "text/html"
     assert payload["content_truncated"] is False
+
+
+def test_no_body_sample_is_kept_by_default():
+    status = run_check(body_responder(b"DB_PASSWORD=hunter2"), checksum=True)
+    assert status.body_sample == ""
+
+
+def test_body_sample_is_kept_when_asked_and_bounded():
+    body = b"DB_PASSWORD=hunter2\n" + b"x" * 1000
+    status = run_check(body_responder(body), checksum=True, keep_body_chars=40)
+    assert status.body_sample.startswith("DB_PASSWORD=hunter2")
+    assert len(status.body_sample) == 40
+    # The checksum still covers the whole body, not just the sample.
+    import hashlib
+
+    assert status.content_checksum == hashlib.sha256(body).hexdigest()
+
+
+def test_body_sample_is_not_kept_for_binary_content():
+    def handler(request):
+        return httpx.Response(200, content=b"\x89PNG....", headers={"Content-Type": "image/png"})
+
+    status = run_check(handler, checksum=True, keep_body_chars=100)
+    assert status.body_sample == ""
+    assert status.content_checksum
+
+
+def test_body_sample_honours_the_declared_charset():
+    def handler(request):
+        return httpx.Response(
+            200, content="Grüße".encode("latin-1"),
+            headers={"Content-Type": "text/plain; charset=latin-1"},
+        )
+
+    status = run_check(handler, checksum=True, keep_body_chars=100)
+    assert status.body_sample == "Grüße"
+
+
+def test_body_sample_never_reaches_the_report():
+    status = run_check(body_responder(b"secret body"), checksum=True, keep_body_chars=100)
+    assert status.body_sample == "secret body"
+    assert "body_sample" not in status.to_dict()
+    assert "secret body" not in json.dumps(status.to_dict())
+
+
+def test_an_octet_stream_body_that_looks_like_text_is_sampled():
+    """Servers label a .env they never meant to serve as octet-stream."""
+
+    def handler(request):
+        return httpx.Response(
+            200, content=b"DB_PASSWORD=hunter2\n", headers={"Content-Type": "application/octet-stream"}
+        )
+
+    status = run_check(handler, checksum=True, keep_body_chars=100)
+    assert status.body_sample == "DB_PASSWORD=hunter2\n"
+
+
+def test_an_octet_stream_body_with_nul_bytes_is_not_sampled():
+    def handler(request):
+        return httpx.Response(
+            200, content=b"PK\x03\x04\x00\x00binary", headers={"Content-Type": "application/octet-stream"}
+        )
+
+    status = run_check(handler, checksum=True, keep_body_chars=100)
+    assert status.body_sample == ""
+
+
+def test_a_body_without_a_content_type_is_sniffed():
+    def handler(request):
+        return httpx.Response(200, content=b"[core]\n\trepositoryformatversion = 0\n")
+
+    status = run_check(handler, checksum=True, keep_body_chars=100)
+    assert status.body_sample.startswith("[core]")

@@ -15,6 +15,7 @@ from .analyzer import DEFAULT_BASE_URL, DEFAULT_MODEL, AnalyzerError, AnalyzerOp
 from .capture import CaptureOptions
 from .categories import load_categories
 from .config import ScanConfig
+from .content import ContentPatternError, load_patterns
 from .mailer import DEFAULT_SUBJECT_PREFIX
 from .mailer import DEFAULT_TIMEOUT_S as MAIL_TIMEOUT_S
 from .mailer import TRANSPORTS, MailOptions, send_report, write_mail_report
@@ -188,6 +189,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=2000,
         help="how much extracted page text to send with the screenshot (default: %(default)s)",
     )
+    ai.add_argument(
+        "--no-content-check",
+        dest="content_check",
+        action="store_false",
+        default=True,
+        help="skip the deterministic pattern check of page text, DOM and raw "
+        "body for credentials, keys, personal data and debug output. On by "
+        "default; it needs no model and no API key",
+    )
+    ai.add_argument(
+        "--content-patterns-file",
+        metavar="PATH",
+        help="JSON file adding to (or, with \"replace\": true, replacing) the "
+        "built-in content-check patterns",
+    )
+    ai.add_argument(
+        "--content-max-chars",
+        type=int,
+        default=500_000,
+        metavar="N",
+        help="how much page text, DOM and raw body the content check reads per "
+        "target (default: %(default)s)",
+    )
 
     browser = parser.add_argument_group("browser")
     browser.add_argument(
@@ -351,6 +375,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("critical", "high", "medium", "low", "info", "none"),
         default="high",
         help="exit 1 when a finding at this severity or above exists (default: %(default)s)",
+    )
+    run.add_argument(
+        "--fail-on-unevaluated",
+        action="store_true",
+        help="exit 1 when any target did not get through every stage the run "
+        "asked for — skipped, not captured, or the model failed on it — so a "
+        "pipeline cannot pass on a target it never actually looked at",
     )
     run.add_argument(
         "--dry-run",
@@ -796,6 +827,8 @@ def build_config(
         for name, value in parse_headers(args.header).items()
     }
 
+    content_max_chars = max(0, args.content_max_chars) if args.content_check else 0
+
     capture = CaptureOptions(
         viewport_width=width,
         viewport_height=height,
@@ -814,9 +847,14 @@ def build_config(
         browser_channel=args.browser_channel,
         executable_path=args.browser_executable,
         block_private_redirects=not args.allow_private_redirects,
+        content_max_chars=content_max_chars,
     )
 
     categories = load_categories(args.categories_file)
+    try:
+        content_patterns = load_patterns(args.content_patterns_file)
+    except ContentPatternError as exc:
+        raise ValueError(str(exc)) from exc
 
     analyzer: AnalyzerOptions | None = None
     # No browser means no screenshot, and the model has nothing to look at.
@@ -859,6 +897,9 @@ def build_config(
         max_concurrency=max(1, args.status_concurrency),
         checksum=args.status_checksum,
         checksum_max_bytes=max(0, args.status_checksum_max_bytes),
+        # The body is already being read for the checksum; keeping a sample
+        # is what lets a browserless run still find a key in a .env file.
+        keep_body_chars=content_max_chars,
         block_private_redirects=not args.allow_private_redirects,
     )
 
@@ -883,6 +924,8 @@ def build_config(
         status_check=status_check,
         analyzer=analyzer,
         categories=categories,
+        content_check=args.content_check,
+        content_patterns=content_patterns,
         concurrency=max(1, args.concurrency),
         ai_concurrency=max(1, args.ai_concurrency),
         respect_robots=args.respect_robots,
@@ -1306,6 +1349,8 @@ def main(argv: list[str] | None = None) -> int:
         if any(f.severity.rank >= config.fail_on.rank for r in report.results for f in r.findings):
             return EXIT_FINDINGS
     if args.fail_on_status and report.status_failures:
+        return EXIT_FINDINGS
+    if args.fail_on_unevaluated and report.unevaluated:
         return EXIT_FINDINGS
     return upload_status or db_status
 

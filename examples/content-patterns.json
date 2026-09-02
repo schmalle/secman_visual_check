@@ -1,0 +1,34 @@
+{
+  "_comment": "Extra patterns for --content-patterns-file. A list appends to the built-ins; wrap it in {\"replace\": true, \"patterns\": [...]} to start from nothing. An entry whose id matches a built-in overrides it.",
+  "patterns": [
+    {
+      "id": "internal_marker",
+      "category": "internal_documents",
+      "severity": "high",
+      "title": "Internal-only banner on a public page",
+      "regex": "(?i)\\b(?:internal use only|confidential - do not distribute|for internal distribution)\\b",
+      "recommendation": "Confirm the page is meant to be public; otherwise gate it behind authentication.",
+      "confidence": 0.7,
+      "sources": ["text"]
+    },
+    {
+      "id": "corp_hostname",
+      "category": "infrastructure_disclosure",
+      "severity": "medium",
+      "title": "Internal hostname in page content",
+      "regex": "\\b[a-z0-9-]+\\.corp\\.example\\.internal\\b",
+      "recommendation": "Remove internal hostnames from public pages.",
+      "confidence": 0.8
+    },
+    {
+      "id": "private_ip",
+      "category": "infrastructure_disclosure",
+      "severity": "high",
+      "title": "Private network address in page text",
+      "regex": "\\b(?:10\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}|192\\.168\\.\\d{1,3}\\.\\d{1,3}|172\\.(?:1[6-9]|2\\d|3[01])\\.\\d{1,3}\\.\\d{1,3})\\b",
+      "recommendation": "Remove internal addressing from public pages.",
+      "confidence": 0.6,
+      "sources": ["text"]
+    }
+  ]
+}

@@ -70,7 +70,20 @@ CRITICALITY_BY_SEVERITY = {
 
 # Pagination guard: existing-id lookups walk pages until exhausted; never forever.
 _MAX_PAGES = 50
+#: SecMan clamps ``size`` to 500 on ``/api/vulnerabilities/current`` and
+#: ``pageSize`` to 500 on ``get_vulnerabilities``; asking for more is silently
+#: reduced, so this is the ceiling, not a preference.
 _PAGE_SIZE = 500
+
+#: Tags merged onto assets this tool registers. SecMan merges tags additively,
+#: so an operator's own tags on the same asset are never touched.
+ASSET_TAGS = {"source": "secman-visual-check"}
+
+
+def asset_description(uri: str) -> str:
+    """The one line SecMan lets a scanner attach to an asset."""
+    return f"Registered by secman_visual_check (first scanned URL: {uri})"[:1000]
+
 
 _RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504, 529})
 
@@ -467,8 +480,12 @@ class _HttpxBacked(SecmanUploader):
         if closer:
             closer()
 
-    def _send(self, method: str, path: str, **kwargs: Any):
-        """One request with retries on transient statuses and transport errors."""
+    def _send(self, method: str, path: str, retry_statuses: frozenset = _RETRY_STATUSES, **kwargs: Any):
+        """One request with retries on transient statuses and transport errors.
+
+        ``retry_statuses`` narrows which HTTP answers are worth another try;
+        transport errors are always retried.
+        """
         import httpx
 
         delay = self.retry_backoff
@@ -484,7 +501,7 @@ class _HttpxBacked(SecmanUploader):
                 delay *= 2
                 continue
 
-            if response.status_code in _RETRY_STATUSES and attempt < self.max_retries:
+            if response.status_code in retry_statuses and attempt < self.max_retries:
                 attempt += 1
                 time.sleep(delay)
                 delay *= 2
@@ -548,8 +565,18 @@ class HttpUploader(_HttpxBacked):
         response = self._send(
             "POST",
             "/api/auth/login",
+            # SecMan rate-limits logins: five failures lock the account name
+            # for fifteen minutes and answer 429. Retrying a 429 here would
+            # only spend the remaining attempts on the same wrong password.
+            retry_statuses=_RETRY_STATUSES - {429},
             json={"username": self.username, "password": self.password or ""},
         )
+        if response.status_code == 429:
+            raise SecmanError(
+                "SecMan login is rate-limited for this account (HTTP 429); wait "
+                "fifteen minutes before trying again, or pass an existing JWT with "
+                "--secman-token"
+            )
         if response.status_code >= 400:
             raise SecmanError(
                 f"SecMan login failed (HTTP {response.status_code}): {self._detail(response)}"
@@ -570,6 +597,12 @@ class HttpUploader(_HttpxBacked):
                 response = self._send(
                     "GET",
                     "/api/vulnerabilities/current",
+                    # One query per host, never one ``cve=<prefix>`` query for
+                    # all of them: SecMan routes a ``cve`` or ``sort`` filter
+                    # combined with ``exceptionStatus=all`` into a code path
+                    # that rejects "all" and answers 500. The per-host form is
+                    # the one upstream keeps deliberately unfiltered for this
+                    # client (docs/CROWDSTRIKE_IMPORT.md in the SecMan repo).
                     params={
                         "system": hostname,
                         # Anything SecMan does not recognise here means "no exception
@@ -622,11 +655,23 @@ class HttpUploader(_HttpxBacked):
         It looks the asset up by name and merges, preserving operator-set fields,
         so re-running a scan never mints a second asset. It needs the ADMIN role;
         a 401/403 is reported per item rather than aborting the upload.
+
+        ``description`` and ``tags`` are the only free-text SecMan accepts from
+        a scanner anywhere — vulnerabilities carry none — so the asset is where
+        "this came from the visual check" is recorded. Tags merge additively on
+        SecMan's side and never overwrite an operator's own.
         """
         response = self._send(
             "PUT",
             "/api/assets/import",
-            json={"name": hostname, "type": asset_type, "owner": owner, "uri": uri},
+            json={
+                "name": hostname,
+                "type": asset_type,
+                "owner": owner,
+                "uri": uri,
+                "description": asset_description(uri),
+                "tags": ASSET_TAGS,
+            },
         )
         if response.status_code >= 400:
             raise SecmanError(
@@ -757,7 +802,14 @@ class McpUploader(_HttpxBacked):
                 if name in wanted and vuln_id:
                     found.add((name, str(vuln_id)))
             total_pages = payload.get("totalPages")
-            if not rows or (isinstance(total_pages, int) and page + 1 >= total_pages):
+            # ``totalPages`` is computed before SecMan's own post-filters
+            # (excepted rows, installer artefacts) thin a page out, so a page
+            # can be empty while more remain. Trust the page count when it is
+            # given; fall back to "empty means done" only when it is not.
+            if isinstance(total_pages, int):
+                if page + 1 >= total_pages:
+                    break
+            elif not rows:
                 break
         return found
 
@@ -784,7 +836,13 @@ class McpUploader(_HttpxBacked):
         try:
             result = self._call_tool(
                 "create_asset",
-                {"name": hostname, "type": asset_type, "owner": owner, "uri": uri},
+                {
+                    "name": hostname,
+                    "type": asset_type,
+                    "owner": owner,
+                    "uri": uri,
+                    "description": asset_description(uri),
+                },
             )
         except SecmanError as exc:
             message = str(exc).lower()

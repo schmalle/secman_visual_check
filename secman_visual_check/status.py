@@ -50,6 +50,11 @@ class StatusCheckOptions:
     #: the content changed is answering a less useful question.
     checksum: bool = True
     checksum_max_bytes: int = DEFAULT_CHECKSUM_MAX_BYTES
+    #: Retain up to this many characters of the checksummed body, decoded, as
+    #: ``UrlStatus.body_sample`` for the content check. Only text-like content
+    #: types are kept; 0 (the default) retains nothing. The checksum fetch is
+    #: the only time a body is read, so this costs no extra request.
+    keep_body_chars: int = 0
     user_agent: str | None = None
     extra_headers: dict[str, str] = field(default_factory=dict)
     basic_auth: tuple[str, str] | None = None
@@ -257,6 +262,9 @@ class UrlStatusChecker:
         size = 0
         limit = self.options.checksum_max_bytes
         scoped = self._scoped_kwargs(status.final_url, original_host)
+        keep = self.options.keep_body_chars
+        retained: list[bytes] = []
+        retained_size = 0
 
         try:
             async with client.stream("GET", status.final_url, **scoped) as response:
@@ -265,7 +273,13 @@ class UrlStatusChecker:
                     # The target changed answer between the walk and this fetch.
                     status.content_type = None
                     return
+                # Bytes, not characters, bound the buffer here; a multi-byte
+                # encoding can only make the decoded sample shorter.
+                keep_bytes = keep * 4 if keep > 0 and not _is_binary_type(status.content_type) else 0
                 async for chunk in response.aiter_bytes():
+                    if keep_bytes and retained_size < keep_bytes:
+                        retained.append(chunk[: keep_bytes - retained_size])
+                        retained_size += len(retained[-1])
                     if limit and size + len(chunk) > limit:
                         digest.update(chunk[: limit - size])
                         size = limit
@@ -273,6 +287,16 @@ class UrlStatusChecker:
                         break
                     digest.update(chunk)
                     size += len(chunk)
+                if retained:
+                    raw = b"".join(retained)
+                    # A served .env or .git/config usually arrives as
+                    # application/octet-stream or with no type at all — the
+                    # files this exists for. Sniff those instead of trusting
+                    # the label; declared text types are taken at their word.
+                    if _is_text_like(status.content_type) or _looks_like_text(raw):
+                        status.body_sample = _decode(
+                            raw, response.headers.get("content-type")
+                        )[:keep]
         except httpx.HTTPError as exc:
             # The status verdict already stands; a failed body read only costs
             # us the checksum, so it is recorded rather than promoted to an error.
@@ -322,6 +346,60 @@ class UrlStatusChecker:
         scoped = self._scoped_kwargs(url, original_host)
         async with client.stream("GET", url, **scoped) as response:
             return response
+
+
+_TEXT_LIKE_TYPES = ("text/", "application/json", "application/javascript",
+                    "application/xml", "application/x-yaml", "application/yaml",
+                    "application/x-www-form-urlencoded", "application/ld+json")
+
+
+_BINARY_TYPES = ("image/", "video/", "audio/", "font/", "application/pdf",
+                 "application/zip", "application/gzip", "application/x-gzip",
+                 "application/x-tar", "application/x-bzip", "application/x-7z",
+                 "application/x-rar", "application/wasm", "application/vnd.",
+                 "application/x-msdownload", "application/java-archive")
+
+
+def _is_text_like(content_type: str | None) -> bool:
+    """A body whose declared type says it is text."""
+    if not content_type:
+        return False
+    lowered = content_type.split(";")[0].strip().lower()
+    return lowered.startswith(_TEXT_LIKE_TYPES) or lowered.endswith(("+json", "+xml"))
+
+
+def _is_binary_type(content_type: str | None) -> bool:
+    """A body whose declared type says it is not worth reading at all.
+
+    ``application/octet-stream`` and a missing header are deliberately *not*
+    here: that is how most servers label a ``.env`` or ``.git/config`` they
+    were never meant to serve, so those bodies are sniffed instead.
+    """
+    if not content_type:
+        return False
+    lowered = content_type.split(";")[0].strip().lower()
+    return lowered.startswith(_BINARY_TYPES)
+
+
+def _looks_like_text(raw: bytes, sample: int = 2048) -> bool:
+    """Cheap sniff for an unlabelled body: no NUL bytes, mostly printable."""
+    head = raw[:sample]
+    if not head or b"\x00" in head:
+        return False
+    printable = sum(1 for b in head if b >= 0x20 or b in (0x09, 0x0A, 0x0D))
+    return printable / len(head) >= 0.9
+
+
+def _decode(raw: bytes, content_type: str | None) -> str:
+    charset = "utf-8"
+    if content_type and "charset=" in content_type.lower():
+        candidate = content_type.lower().split("charset=", 1)[1].split(";")[0].strip(" \"'")
+        if candidate:
+            charset = candidate
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
 
 def _classify(status: UrlStatus) -> str:

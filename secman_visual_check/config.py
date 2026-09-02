@@ -8,6 +8,7 @@ from pathlib import Path
 from .analyzer import AnalyzerOptions
 from .capture import CaptureOptions
 from .categories import Category
+from .content import DEFAULT_PATTERNS, ContentPattern
 from .models import Severity
 from .status import StatusCheckOptions
 
@@ -22,6 +23,11 @@ class ScanConfig:
     status_check: StatusCheckOptions = field(default_factory=StatusCheckOptions)
     analyzer: AnalyzerOptions | None = None
     categories: list[Category] = field(default_factory=list)
+    #: The deterministic pattern check over page text, DOM and raw body. On by
+    #: default and independent of the model: it is what still finds a private
+    #: key when the model is off, failed, or could not see below the clamp.
+    content_check: bool = True
+    content_patterns: list[ContentPattern] = field(default_factory=lambda: list(DEFAULT_PATTERNS))
     concurrency: int = 4
     ai_concurrency: int = 3
     respect_robots: bool = False

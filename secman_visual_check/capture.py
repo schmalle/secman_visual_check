@@ -128,6 +128,11 @@ class CaptureOptions:
     basic_auth: tuple[str, str] | None = None
     storage_state: str | None = None
     text_excerpt_chars: int = 4000
+    #: How much of the rendered text and of the DOM serialisation to keep in
+    #: memory for the content check (content.py). Separate from
+    #: ``text_excerpt_chars``, which bounds what lands in the report; 0 keeps
+    #: nothing and turns the browser-side content check off.
+    content_max_chars: int = 500_000
     device_scale_factor: float = 1.0
     browser_channel: str | None = None
     executable_path: str | None = None
@@ -334,10 +339,17 @@ class BrowserCapturer:
                 return capture
 
             capture.title = await _safe(page.title)
-            capture.text_excerpt = _truncate(
-                await _safe(lambda: page.inner_text("body")) or "",
-                options.text_excerpt_chars,
-            )
+            body_text = await _safe(lambda: page.inner_text("body")) or ""
+            capture.text_excerpt = _truncate(body_text, options.text_excerpt_chars)
+            if options.content_max_chars > 0:
+                # Kept whole (up to the cap) for the content check: the
+                # excerpt above is what a reader sees in the report, but a
+                # leaked key on line 900 of a long page is still a leak. The
+                # DOM serialisation is read too — comments, inline scripts and
+                # data attributes never reach inner_text, and never reach the
+                # screenshot either.
+                capture.page_text = body_text[: options.content_max_chars]
+                capture.page_html = (await _safe(lambda: page.content()) or "")[: options.content_max_chars]
             capture.page_height = await _safe(
                 lambda: page.evaluate(
                     "() => Math.max(document.documentElement.scrollHeight,"

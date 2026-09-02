@@ -12,6 +12,7 @@ a scan updates the rows it already created instead of piling up duplicates.
 - [Status findings and asset registration](#status-findings-and-asset-registration)
 - [All options](#all-options)
 - [Exit codes](#exit-codes)
+- [The SecMan contract this tool depends on](#the-secman-contract-this-tool-depends-on)
 - [Troubleshooting](#troubleshooting)
 
 ## Quick start
@@ -54,6 +55,19 @@ exposure finding is not a CVE, so it is mapped like this:
 Severity maps as `critical → CRITICAL`, `high → HIGH`, `medium → MEDIUM`,
 `low → LOW`, `info → LOW`. SecMan has no informational level, so `info` lands on
 `LOW`; by default `--secman-min-severity medium` means neither is uploaded at all.
+
+Findings from the [content check](CONTENT_CHECK.md) are uploaded exactly like
+the model's — they carry a category and a severity and map onto the same
+synthetic ID. A page the model flagged for `exposed_credentials` and the
+content check flagged for the same category is one SecMan row, not two.
+
+**Nothing else reaches SecMan.** A SecMan vulnerability has no description,
+title, URL or evidence field, and neither `cli-add` nor the MCP tool accepts
+one. The finding's title, evidence and recommendation exist only in this
+tool's own reports; SecMan shows the ID, the asset and the criticality. Keep
+`report.json` if you need the detail later — `--secman-upload-report` can
+replay it, and the ID in SecMan decodes back to page and category via the
+category slug it carries.
 
 ### The synthetic vulnerability ID
 
@@ -233,6 +247,10 @@ findings — useful when the scan *is* the discovery step.
 One row per distinct host, not per page. The asset is named after the host
 (or `--secman-asset-name`), owned by `--secman-owner`, typed by
 `--secman-asset-type`, with the first URL seen on that host recorded as its URI.
+The asset also gets a description (`Registered by secman_visual_check (first
+scanned URL: …)`) and, over http, the tag `source=secman-visual-check` — the
+asset is the only object SecMan lets a scanner annotate, and tags merge
+additively so an operator's own are never touched.
 
 Output looks like:
 
@@ -293,10 +311,51 @@ Without `--secman-fail-on-error`, individual failures are reported in the summar
 and counted, but do not change the exit code. Individual failures never abort the
 run: each remaining finding is still attempted.
 
+## The SecMan contract this tool depends on
+
+Verified against SecMan `main` on 2026-08-31. SecMan's own `CLAUDE.md` names
+this tool as an extension client and pins the same list, and its pull-request
+template asks contributors to re-check it, so a breaking change upstream should
+be visible there first.
+
+| Surface | What this tool sends | What it reads | Role |
+| --- | --- | --- | --- |
+| `POST /api/auth/login` | `username`, `password` | `mfaRequired`; the JWT arrives in the `secman_auth` cookie | any |
+| `POST /api/vulnerabilities/cli-add` | `hostname`, `cve`, `criticality` (`CRITICAL\|HIGH\|MEDIUM\|LOW`), `daysOpen`, `owner` | `operation` (`CREATED`/`UPDATED`), `message` | `ADMIN` or `VULN` |
+| `GET /api/vulnerabilities/current` | `system`, `exceptionStatus=all`, `page`, `size` (≤ 500) | `content[].assetName`, `content[].vulnerabilityId`, `hasNext` | `ADMIN`, `VULN` or `SECCHAMPION` |
+| `PUT /api/assets/import` | `name`, `type`, `owner`, `uri`, `description`, `tags` | `created`, `asset.id` | `ADMIN` |
+| `POST /mcp` — `initialize`, `notifications/initialized` | protocol `2024-11-05`, `X-MCP-API-Key`, `X-MCP-User-Email` | — | key |
+| MCP `add_vulnerability` | as `cli-add` | `vulnerabilityCreated`, `message` | delegated user `ADMIN` or `VULN` |
+| MCP `get_vulnerabilities` | `cveId` (prefix), `includeExcepted`, `page`, `pageSize` (≤ 500) | `vulnerabilities[].assetName`, `.vulnerabilityId`, `totalPages` | read |
+| MCP `create_asset` | `name`, `type`, `owner`, `uri`, `description` | `message`; a `DUPLICATE_ASSET` error is read as *already registered* | delegated user |
+
+Behaviour this tool is built around:
+
+- **`exceptionStatus=all` is deliberately unfiltered upstream** for this
+  client's sake. It must stay a per-host query: adding `cve=` or `sort=` to
+  it routes into a code path that rejects `all` and answers **500**.
+- **Login is rate-limited**: five failures lock the username for fifteen
+  minutes and answer 429. The tool does not retry a 429 on login — every retry
+  would spend another attempt on the same wrong password — and says so.
+- **MCP `totalPages` is computed before SecMan's post-filters** (excepted rows,
+  installer artefacts), so a page can come back empty while more remain. The
+  existing-ID walk trusts `totalPages` when it is given and only treats an
+  empty page as the end when it is not.
+- **Bearer JWTs are accepted on every REST call**, so `--secman-token` works
+  without a login. There are no REST API keys; the only key-based
+  authentication is MCP's.
+- **There is no bulk or detail-carrying ingest tool.** The one write path that
+  accepts a product/description field (`/api/crowdstrike/vulnerabilities/save`)
+  *replaces every vulnerability on the asset* and must never be used here.
+
 ## Troubleshooting
 
 **`SecMan requires MFA for this account`** — the login endpoint answered
 `mfaRequired`. Use an automation account without MFA, or pass `--secman-token`.
+
+**`SecMan login is rate-limited for this account (HTTP 429)`** — five failed
+logins in a row. Wait fifteen minutes, fix the password, or pass a JWT with
+`--secman-token`; the tool will not keep trying on its own.
 
 **`HTTP 401` / `403` on upload** — the account is missing `ADMIN` or `VULN`. On
 MCP, check the API key's permissions, that delegation is enabled on the key, and

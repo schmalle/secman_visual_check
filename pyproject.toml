@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "secman-visual-check"
-version = "0.2.0"
+version = "0.3.0"
 description = "Screenshot URLs with a headless browser and check them for exposed critical content using a vision model."
 readme = "README.md"
 requires-python = ">=3.10"
