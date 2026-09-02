@@ -179,6 +179,9 @@ def build_subject(report: ScanReport, flag_changes: Sequence[Any] = (), prefix: 
     findings = sum(report.severity_counts().values())
     if findings:
         bits.append(f"{findings} finding{'s' if findings != 1 else ''}")
+    unevaluated = len(report.unevaluated)
+    if unevaluated:
+        bits.append(f"{unevaluated} not evaluated")
     headline = ", ".join(bits) if bits else "all clear"
     scope = f"{len(report.results)} target{'s' if len(report.results) != 1 else ''}"
     subject = f"Visual check: {headline} ({scope})"
@@ -251,7 +254,31 @@ def render_html_email(
         for c in list(flag_changes)[:50]
     )
 
+    unevaluated_rows = "".join(
+        "<tr>"
+        f"<td style='padding:12px;text-align:left;border-bottom:1px solid #ddd;"
+        f"word-break:break-all;'>{html.escape(r.url)}</td>"
+        f"<td style='padding:12px;text-align:left;border-bottom:1px solid #ddd;'>"
+        f"{html.escape(r.evaluation.replace('_', ' '))}</td>"
+        f"<td style='padding:12px;text-align:left;border-bottom:1px solid #ddd;'>"
+        f"{html.escape(r.evaluation_detail or '-')}</td>"
+        "</tr>"
+        for r in report.unevaluated[:50]
+    )
+
     sections = []
+    if unevaluated_rows:
+        sections.append(
+            "<div style='background-color:#fff;padding:15px;border-radius:5px;margin:20px 0;'>"
+            f"<h3>Not evaluated ({len(report.unevaluated)})</h3>"
+            "<p>These targets did not get through every stage the run asked for; "
+            "nothing can be said about what they expose.</p>"
+            "<table style='width:100%;border-collapse:collapse;'>"
+            "<tr><th style='padding:12px;text-align:left;border-bottom:2px solid #ddd;'>URL</th>"
+            "<th style='padding:12px;text-align:left;border-bottom:2px solid #ddd;'>State</th>"
+            "<th style='padding:12px;text-align:left;border-bottom:2px solid #ddd;'>Detail</th></tr>"
+            + unevaluated_rows + "</table></div>"
+        )
     if status_rows or severity_rows:
         sections.append(
             "<div style='background-color:#fff;padding:15px;border-radius:5px;margin:20px 0;'>"
@@ -374,6 +401,15 @@ def render_text_email(
             lines.append(f"  [{status.state}] {result.url} - {detail}")
         if len(failures) > 50:
             lines.append(f"  ... and {len(failures) - 50} more")
+        lines.append("")
+
+    unevaluated = report.unevaluated
+    if unevaluated:
+        lines.append(f"{len(unevaluated)} target(s) were not evaluated:")
+        for result in unevaluated[:50]:
+            lines.append(f"  [{result.evaluation}] {result.url} - {result.evaluation_detail}")
+        if len(unevaluated) > 50:
+            lines.append(f"  ... and {len(unevaluated) - 50} more")
         lines.append("")
 
     if flag_changes:
@@ -644,7 +680,12 @@ def send_report(
         summary.skipped_reason = "not enabled"
         return summary
 
-    quiet_run = not report.status_failures and not flag_changes and not report.failed
+    quiet_run = (
+        not report.status_failures
+        and not flag_changes
+        and not report.failed
+        and not report.unevaluated
+    )
     if quiet_run and not options.always:
         summary.skipped_reason = "nothing to report (use --mail-always to send anyway)"
         return summary

@@ -555,3 +555,47 @@ def test_capture_post_connect_check_skipped_when_guard_disabled(tmp_path):
 
     assert capture.load_error is None
     assert capture.title == "Real page title"
+
+
+class FakeContentPage(FakeCapturePage):
+    async def inner_text(self, selector):
+        return "visible text " * 100
+
+    async def content(self):
+        return "<html><!-- AKIAIOSFODNN7EXAMPLE --><body>visible</body></html>"
+
+
+def test_capture_keeps_full_text_and_dom_for_the_content_check(tmp_path):
+    page = FakeContentPage(FakeResponse(200, "https://example.com/", "93.184.216.34"))
+    capturer = make_bare_capturer(tmp_path, page, text_excerpt_chars=20)
+
+    capture = run(capturer.capture("https://example.com/"))
+
+    assert len(capture.text_excerpt) == 20
+    assert len(capture.page_text) == len("visible text " * 100)
+    assert "AKIAIOSFODNN7EXAMPLE" in capture.page_html
+    # In memory only: the report carries the excerpt, never the full content.
+    assert "page_text" not in capture.to_dict()
+    assert "page_html" not in capture.to_dict()
+
+
+def test_capture_keeps_nothing_when_the_content_cap_is_zero(tmp_path):
+    page = FakeContentPage(FakeResponse(200, "https://example.com/", "93.184.216.34"))
+    capturer = make_bare_capturer(tmp_path, page, content_max_chars=0)
+
+    capture = run(capturer.capture("https://example.com/"))
+
+    assert capture.text_excerpt
+    assert capture.page_text == ""
+    assert capture.page_html == ""
+
+
+def test_capture_survives_a_page_without_content_support(tmp_path):
+    page = FakeCapturePage(FakeResponse(200, "https://example.com/", "93.184.216.34"))
+    capturer = make_bare_capturer(tmp_path, page)
+
+    capture = run(capturer.capture("https://example.com/"))
+
+    assert capture.load_error is None
+    assert capture.page_text == "real page body text"
+    assert capture.page_html == ""

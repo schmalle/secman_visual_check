@@ -117,6 +117,19 @@ def _stage_lines(config: ScanConfig) -> list[tuple[str, str]]:
     else:
         lines.append(("analysis", "disabled (no browser, so nothing to look at)"))
 
+    if config.content_check:
+        inputs = []
+        if config.visual_check and config.capture.content_max_chars > 0:
+            inputs.append("page text and DOM")
+        if status.enabled and status.checksum and status.keep_body_chars > 0:
+            inputs.append("raw response body")
+        detail = f"{len(config.content_patterns)} pattern(s) over " + (
+            ", ".join(inputs) if inputs else "nothing — no input stage keeps content"
+        )
+        lines.append(("content check", detail))
+    else:
+        lines.append(("content check", "disabled (--no-content-check)"))
+
     return lines
 
 

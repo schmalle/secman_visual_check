@@ -48,10 +48,27 @@ secrets.py ─→ (every credential, before anything runs)
 
 targets.py → status.py ─┐
                         ├→ scanner.py → reporting.py / db.py / mailer.py / secman.py
-            capture.py → analyzer.py
+            capture.py → analyzer.py ─┤
+                        content.py ───┘   (pattern check over text/DOM/body)
 
 plan.py ←── the same options, described instead of executed (--dry-run)
 ```
+
+**Every target ends with an evaluation state.** `scanner.classify_evaluation`
+records `analysed` / `captured` / `status_only` (every requested stage
+completed) or `analysis_failed` / `capture_failed` / `skipped` / `error`
+on each `ScanResult`. The state encodes what the run *asked for*, so
+`ScanResult.evaluated` is exact and `--fail-on-unevaluated` can gate on it.
+Hand-built results have an empty state and never count as unevaluated. A new
+failure mode must land in one of these states, never in a silent `[INFO]`.
+
+**Two judges per page, kept apart by `Finding.source`.** The model says what
+the page *shows*; `content.py` says what it *contains* (regexes over the
+rendered text, `page.content()` and the status check's body sample). Content
+findings merge into `result.analysis` so every consumer sees them, tagged
+`source="content"`; when no model verdict exists a bare `Analysis` with
+`model="content-check"` is created around them. The content check runs after
+the model, never instead of it, and regardless of the model's outcome.
 
 **Two independent probes per target, deliberately not merged.** `status.py`
 makes a plain HTTP request with redirects disabled and walks the chain by hand;
@@ -96,9 +113,22 @@ the dry-run path — the guarantee is worth more than the feature.
   means editing categories or `prompts.py`, not the analyzer.
 - `capture.PageCapture.worth_analyzing` gates model spend — a screenshot of
   Chromium's own `chrome-error://` page is never sent.
+- `content.py` is policy as data, like `categories.py`: `DEFAULT_PATTERNS` is
+  replaceable via `--content-patterns-file`. Patterns declare which sources
+  they may see; loose ones (`password_assignment`, `bearer_token`, stack
+  traces) are `TEXT_ONLY` because minified JavaScript is full of `password:`.
+  One finding per pattern per page, first match redacted to four characters
+  plus a count — a page cannot flood the report or SecMan. The inputs live in
+  memory only: `PageCapture.page_text` / `page_html` and
+  `UrlStatus.body_sample` are excluded from `to_dict()` by design;
+  `text_excerpt` remains the report's human-readable sample.
+- `analyzer.analyze` re-requests once when the reply has no parseable JSON;
+  transport retries are separate. A page is `analysis_failed` only after both.
 - `status.py` hashes a body only when the target answered an *expected* status
   (`--status-expect`, default 200); a 404's error page changes for reasons
-  nobody wants alerts about. `content_checksum = None` means "not computed" and
+  nobody wants alerts about. The same fetch retains up to `keep_body_chars`
+  of a text-like body as `UrlStatus.body_sample` for the content check — the
+  only way a `--no-visual-check` run can find a key in a served `.env`. `content_checksum = None` means "not computed" and
   is a different fact from a checksum of zero bytes. Hashing is **on by
   default** and costs one extra GET per healthy target on top of the walk's
   HEAD; `--no-status-checksum` opts out and is rejected alongside `--db-store`.
@@ -115,6 +145,16 @@ the dry-run path — the guarantee is worth more than the feature.
   layers (merge before send, skip what SecMan already holds, SecMan's own
   `(asset, cve)` upsert); the middle layer failing is non-fatal by design.
   MCP transport requires the `X-MCP-User-Email` header.
+  The upstream contract this client depends on is pinned in SecMan's own
+  `CLAUDE.md` ("Extension Clients"); re-verify path, method, request fields,
+  response fields read and `@Secured` roles against a fresh checkout of
+  <https://github.com/schmalle/secman> when touching a transport. Known
+  traps: never add `cve=` or `sort=` to the `/api/vulnerabilities/current`
+  call alongside `exceptionStatus=all` (SecMan answers 500); login answers
+  429 after five failures and must not be retried; MCP `totalPages` is
+  computed before post-filters, so an empty page is not the last one.
+  Vulnerabilities carry no free text — asset `description`/`tags` on
+  `PUT /api/assets/import` are the only place a scanner can leave a note.
 - `reporting.py` renders five ways from one `ScanReport`. The CSV is one row
   per *target* (a status-only run must still produce a full table), and every
   cell goes through `_csv_cell`, which prefixes `=`/`+`/`-`/`@` with `'` so

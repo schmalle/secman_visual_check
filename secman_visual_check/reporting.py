@@ -262,6 +262,18 @@ def write_console_report(
             reason = result.error or (result.capture.load_error if result.capture else "unknown")
             print(f"  {result.url} — {reason}", file=out)
 
+    unevaluated = report.unevaluated
+    if unevaluated:
+        print("", file=out)
+        print(f"{len(unevaluated)} target(s) were not evaluated:", file=out)
+        for result in unevaluated:
+            detail = result.evaluation_detail
+            print(
+                f"  {result.url} — {result.evaluation.replace('_', ' ')}"
+                + (f" ({detail})" if detail else ""),
+                file=out,
+            )
+
 
 def _write_statistics_summary(report: ScanReport, out: TextIO) -> None:
     """The derived numbers, deliberately not repeating the two count tables above.
@@ -286,6 +298,20 @@ def _write_statistics_summary(report: ScanReport, out: TextIO) -> None:
             rows.append(("analysed", f"{stats['analysed']:>6}  {_pct(stats['analysed'], targets)}"))
     if stats["skipped"]:
         rows.append(("skipped", f"{stats['skipped']:>6}  {_pct(stats['skipped'], targets)}"))
+    if stats["evaluation_known"]:
+        rows.append(("evaluated", f"{stats['evaluated']:>6}  {_pct(stats['evaluated'], targets)}"))
+        if stats["unevaluated"]:
+            rows.append(
+                ("not evaluated", f"{stats['unevaluated']:>6}  {_pct(stats['unevaluated'], targets)}")
+            )
+    if stats["content_checked"]:
+        rows.append(
+            (
+                "content checked",
+                f"{stats['content_checked']:>6}  {_pct(stats['content_checked'], targets)}"
+                f"  {stats['content_findings']} finding(s)",
+            )
+        )
 
     rows.append(
         (
@@ -387,6 +413,11 @@ def _write_result(result: ScanResult, out: TextIO, use_color: bool, verbose: boo
     if result.status_check is not None:
         _write_status_line(result.status_check, out, use_color)
 
+    if result.evaluation and not result.evaluated:
+        # Said before anything else about the page: whatever follows describes
+        # a target the run did not get through, and must be read that way.
+        print(f"  not evaluated: {result.evaluation.replace('_', ' ')}", file=out)
+
     if result.skipped_reason:
         print(f"  skipped: {result.skipped_reason}", file=out)
         return
@@ -419,7 +450,11 @@ def _write_result(result: ScanResult, out: TextIO, use_color: bool, verbose: boo
         print(f"  {analysis.summary}", file=out)
     for finding in analysis.findings:
         marker = _paint(f"  - [{finding.severity.value}]", finding.severity, use_color)
-        print(f"{marker} {finding.title}  ({finding.category}, conf {finding.confidence:.2f})", file=out)
+        origin = ", content check" if finding.source == "content" else ""
+        print(
+            f"{marker} {finding.title}  ({finding.category}, conf {finding.confidence:.2f}{origin})",
+            file=out,
+        )
         if verbose:
             if finding.evidence:
                 print(f"      evidence: {finding.evidence[:300]}", file=out)
@@ -471,6 +506,9 @@ CSV_COLUMNS = (
     "page_type",
     "summary",
     "error",
+    "evaluation",
+    "evaluated",
+    "content_findings",
 )
 
 #: Excel and LibreOffice evaluate a cell starting with any of these. Page titles
@@ -520,6 +558,9 @@ def csv_rows(report: ScanReport) -> list[dict[str, str]]:
             "page_type": analysis.page_type if analysis else None,
             "summary": analysis.summary if analysis else None,
             "error": error,
+            "evaluation": result.evaluation or None,
+            "evaluated": result.evaluated if result.evaluation else None,
+            "content_findings": sum(1 for f in findings if f.source == "content"),
         }
         rows.append({key: _csv_cell(value) for key, value in row.items()})
     return rows
@@ -580,7 +621,21 @@ def report_statistics(report: ScanReport) -> dict[str, Any]:
         "captured": sum(1 for r in report.results if r.capture and r.capture.ok),
         "capture_failed": len(report.failed),
         "skipped": sum(1 for r in report.results if r.skipped_reason),
-        "analysed": sum(1 for r in report.results if r.analysis is not None),
+        # A model verdict, not any Analysis: the content check wraps its own
+        # findings in one when no model ran, and that is not "analysed".
+        "analysed": sum(
+            1
+            for r in report.results
+            if r.analysis is not None and r.analysis.model != "content-check"
+        ),
+        "evaluation_known": report.evaluation_known,
+        "evaluated": sum(1 for r in report.results if r.evaluated),
+        "unevaluated": len(report.unevaluated),
+        "evaluation_counts": report.evaluation_counts(),
+        "content_checked": sum(1 for r in report.results if r.content_check is not None),
+        "content_findings": sum(
+            1 for r in report.results for f in r.findings if f.source == "content"
+        ),
         "targets_with_findings": sum(1 for r in report.results if r.findings),
         "findings_total": sum(len(r.findings) for r in report.results),
         "severity_counts": report.severity_counts(),
@@ -633,6 +688,24 @@ def render_stats(report: ScanReport) -> str:
             f"  failed            {stats['capture_failed']:>6}  {_pct(stats['capture_failed'], targets)}",
             f"  skipped           {stats['skipped']:>6}  {_pct(stats['skipped'], targets)}",
             f"  analysed          {stats['analysed']:>6}  {_pct(stats['analysed'], targets)}",
+        ]
+
+    if stats["evaluation_known"]:
+        lines += ["", "Coverage"]
+        for state, count in stats["evaluation_counts"].items():
+            if count:
+                lines.append(f"  {state:<17} {count:>6}  {_pct(count, targets)}")
+        lines += [
+            f"  {'evaluated':<17} {stats['evaluated']:>6}  {_pct(stats['evaluated'], targets)}",
+            f"  {'not evaluated':<17} {stats['unevaluated']:>6}  {_pct(stats['unevaluated'], targets)}",
+        ]
+
+    if stats["content_checked"]:
+        lines += [
+            "",
+            "Content check",
+            f"  checked           {stats['content_checked']:>6}  {_pct(stats['content_checked'], targets)}",
+            f"  findings          {stats['content_findings']:>6}",
         ]
 
     lines += ["", "Findings by severity"]
@@ -706,6 +779,23 @@ def render_html(report: ScanReport, base_dir: Path, embed_images: bool = True) -
             if status_counts.get(state, 0)
         ) + "</div>"
 
+    coverage_cards = ""
+    if report.evaluation_known:
+        evaluated = sum(1 for r in report.results if r.evaluated)
+        unevaluated = len(report.unevaluated)
+        coverage_cards = (
+            '<div class="stats">'
+            f'<div class="stat" style="--c:#2f9e44"><span class="n">{evaluated}</span>'
+            '<span class="l">evaluated</span></div>'
+            + (
+                f'<div class="stat" style="--c:#b3103c"><span class="n">{unevaluated}</span>'
+                '<span class="l">not evaluated</span></div>'
+                if unevaluated
+                else ""
+            )
+            + "</div>"
+        )
+
     sections = "\n".join(_render_result(r, base_dir, embed_images) for r in report.results)
 
     return f"""<!doctype html>
@@ -764,6 +854,7 @@ def render_html(report: ScanReport, base_dir: Path, embed_images: bool = True) -
     started {html.escape(report.started_at.isoformat(timespec="seconds"))}
   </div>
   <div class="stats">{cards}</div>
+  {coverage_cards}
   {status_cards}
   {sections}
 </div>
@@ -784,6 +875,14 @@ def _render_result(result: ScanResult, base_dir: Path, embed_images: bool) -> st
 
     if result.status_check is not None:
         parts.append(_render_status(result.status_check))
+
+    if result.evaluation and not result.evaluated:
+        parts.append(
+            '<p class="kv"><span class="status" style="background:#b3103c">not evaluated</span>'
+            f"{html.escape(result.evaluation.replace('_', ' '))}"
+            + (f" &middot; {html.escape(result.evaluation_detail)}" if result.evaluation_detail else "")
+            + "</p>"
+        )
 
     if result.skipped_reason:
         parts.append(f'<p class="kv">Skipped: {html.escape(result.skipped_reason)}</p>')
@@ -819,7 +918,9 @@ def _render_result(result: ScanResult, base_dir: Path, embed_images: bool) -> st
                 f'<h3><span class="badge" style="background:{fcolor}">'
                 f"{finding.severity.value}</span>{html.escape(finding.title)}</h3>",
                 f'<p class="kv">{html.escape(finding.category)} &middot; '
-                f"confidence {finding.confidence:.2f}</p>",
+                f"confidence {finding.confidence:.2f}"
+                + (" &middot; content check" if finding.source == "content" else "")
+                + "</p>",
             ]
             if finding.evidence:
                 block.append(

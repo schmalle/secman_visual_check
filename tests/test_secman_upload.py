@@ -915,6 +915,9 @@ def test_http_uploader_registers_an_asset_through_the_import_endpoint():
         "type": "Web Service",
         "owner": "team",
         "uri": "https://example.com/",
+        # The only free text SecMan accepts from a scanner lives on the asset.
+        "description": "Registered by secman_visual_check (first scanned URL: https://example.com/)",
+        "tags": {"source": "secman-visual-check"},
     }
     assert status == "created"
     assert "asset id 7" in detail
@@ -939,3 +942,84 @@ def test_http_uploader_reports_an_existing_asset_as_updated():
         "example.com", "team", "https://example.com/", "Web Service"
     )
     assert status == "updated"
+
+
+def test_http_login_does_not_retry_a_rate_limited_account():
+    """SecMan locks a username after five failures; retrying a 429 burns them."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(429, json={"error": "Too many attempts"})
+
+    client = httpx.Client(
+        base_url="https://secman.test", transport=httpx.MockTransport(handler)
+    )
+    uploader = HttpUploader(
+        "https://secman.test", client=client, max_retries=3, retry_backoff=0,
+        username="bot", password="pw",
+    )
+    with pytest.raises(SecmanError, match="rate-limited"):
+        uploader.connect()
+    assert calls == ["/api/auth/login"]
+
+
+def test_mcp_existing_ids_keep_paging_past_an_empty_page():
+    """``totalPages`` is computed before SecMan's post-filters thin a page out."""
+    pages = {
+        0: [{"assetName": "example.com", "vulnerabilityId": "X-1"}],
+        1: [],
+        2: [{"assetName": "example.com", "vulnerabilityId": "X-3"}],
+    }
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        page = body["params"]["arguments"]["page"]
+        seen.append(page)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": body["id"],
+                "result": tool_result({"vulnerabilities": pages[page], "totalPages": 3}),
+            },
+        )
+
+    found = mcp_uploader(handler).existing_vulnerability_ids(["example.com"], DEFAULT_ID_PREFIX)
+    assert seen == [0, 1, 2]
+    assert found == {("example.com", "X-1"), ("example.com", "X-3")}
+
+
+def test_mcp_existing_ids_stop_on_an_empty_page_without_a_page_count():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.append(body["params"]["arguments"]["page"])
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": body["id"], "result": tool_result({"vulnerabilities": []})},
+        )
+
+    mcp_uploader(handler).existing_vulnerability_ids(["example.com"], DEFAULT_ID_PREFIX)
+    assert seen == [0]
+
+
+def test_mcp_create_asset_sends_a_description():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen.update(body["params"]["arguments"])
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": body["id"], "result": tool_result({"id": 3, "message": "ok"})},
+        )
+
+    status, _ = mcp_uploader(handler).register_asset(
+        "example.com", "team", "https://example.com/", "Web Service"
+    )
+    assert status == "created"
+    assert seen["description"].startswith("Registered by secman_visual_check")
+    assert seen["uri"] == "https://example.com/"

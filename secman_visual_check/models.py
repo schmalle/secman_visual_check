@@ -79,6 +79,12 @@ class Finding:
     evidence: str = ""
     recommendation: str = ""
     confidence: float = 0.0
+    #: Who produced it: ``model`` for the vision verdict, ``content`` for the
+    #: deterministic pattern check (content.py). The two are kept apart in the
+    #: reports because they carry different evidence — a model finding is a
+    #: judgement about what the page *shows*, a content finding is a literal
+    #: match in what the page *contains*.
+    source: str = "model"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -88,6 +94,7 @@ class Finding:
             "evidence": self.evidence,
             "recommendation": self.recommendation,
             "confidence": round(self.confidence, 3),
+            "source": self.source,
         }
 
 
@@ -106,6 +113,12 @@ class PageCapture:
     duration_s: float = 0.0
     viewport: tuple[int, int] = (0, 0)
     page_height: int | None = None
+    #: The full rendered text and DOM serialisation, kept in memory for the
+    #: content check only — deliberately absent from ``to_dict()``: they can
+    #: run to hundreds of kilobytes per page and the report already carries
+    #: ``text_excerpt`` for a human reader.
+    page_text: str = field(default="", repr=False)
+    page_html: str = field(default="", repr=False)
 
     @property
     def ok(self) -> bool:
@@ -199,6 +212,11 @@ class UrlStatus:
     error: str | None = None
     elapsed_s: float = 0.0
     checked_at: datetime = field(default_factory=utcnow)
+    #: The first bytes of the body the checksum fetch read, decoded, kept only
+    #: when the caller asked for them (``StatusCheckOptions.keep_body_chars``)
+    #: and only for text-like content types. Feeds the content check on runs
+    #: without a browser; never serialised.
+    body_sample: str = field(default="", repr=False)
 
     @property
     def ok(self) -> bool:
@@ -274,6 +292,59 @@ class Analysis:
 
 
 @dataclass
+class ContentCheck:
+    """What the deterministic pattern check looked at for one target.
+
+    The findings it produced live in :attr:`ScanResult.analysis` alongside the
+    model's, tagged ``source="content"``; this records only the scope, so a
+    report can say *what was searched* even when nothing matched.
+    """
+
+    #: Which inputs were available: ``text`` (rendered page text), ``html``
+    #: (DOM serialisation) and ``body`` (raw response from the status check).
+    sources: list[str] = field(default_factory=list)
+    chars_scanned: int = 0
+    matches: int = 0
+    findings: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "sources": list(self.sources),
+            "chars_scanned": self.chars_scanned,
+            "matches": self.matches,
+            "findings": self.findings,
+        }
+
+
+#: How far a target got through the stages the run asked for. The states
+#: encode what was *requested* as well as what happened, so a plain
+#: ``evaluated`` answer falls out of the state alone — see EVALUATED_STATES.
+EVALUATION_STATES = (
+    #: the model returned a usable verdict
+    "analysed",
+    #: the model was asked and failed, or answered unusably
+    "analysis_failed",
+    #: screenshot taken; no model was requested (--no-ai)
+    "captured",
+    #: the browser produced no usable screenshot
+    "capture_failed",
+    #: no browser was requested (--no-visual-check); the status check ran
+    "status_only",
+    #: skipped before any stage ran (robots.txt)
+    "skipped",
+    #: an unexpected exception stopped the pipeline for this target
+    "error",
+)
+
+#: States in which every stage the run asked for completed for the target.
+#: A status-only run that found a host unreachable *did* evaluate it — the
+#: check ran and produced a verdict; ``--fail-on-status`` is the gate for
+#: that. What this answers is "was the target looked at the way the run
+#: promised to", which is the question a coverage gate needs.
+EVALUATED_STATES = frozenset({"analysed", "captured", "status_only"})
+
+
+@dataclass
 class ScanResult:
     """Capture + analysis for a single target."""
 
@@ -281,8 +352,36 @@ class ScanResult:
     capture: PageCapture | None = None
     status_check: UrlStatus | None = None
     analysis: Analysis | None = None
+    content_check: ContentCheck | None = None
     error: str | None = None
     skipped_reason: str | None = None
+    #: One of :data:`EVALUATION_STATES`, set by the scanner once the target's
+    #: pipeline has finished. Empty when the result was built by hand (tests,
+    #: report loaders) and coverage is simply not known.
+    evaluation: str = ""
+
+    @property
+    def evaluated(self) -> bool:
+        return self.evaluation in EVALUATED_STATES
+
+    @property
+    def evaluation_detail(self) -> str:
+        """Why an unevaluated target was not evaluated, for the reports."""
+        if self.evaluation == "skipped":
+            return self.skipped_reason or "skipped"
+        if self.evaluation == "error":
+            return self.error or "error"
+        if self.evaluation == "capture_failed":
+            if self.capture is not None and self.capture.is_browser_error_page:
+                return self.capture.load_error or "browser error page"
+            if self.capture is not None and self.capture.load_error:
+                return self.capture.load_error
+            return "no screenshot"
+        if self.evaluation == "analysis_failed":
+            if self.analysis is not None and self.analysis.error:
+                return f"analysis error: {self.analysis.error}"
+            return "analysis error"
+        return ""
 
     @property
     def max_severity(self) -> Severity:
@@ -301,9 +400,12 @@ class ScanResult:
             "url": self.url,
             "error": self.error,
             "skipped_reason": self.skipped_reason,
+            "evaluation": self.evaluation,
+            "evaluated": self.evaluated,
             "max_severity": self.max_severity.value,
             "status_check": self.status_check.to_dict() if self.status_check else None,
             "capture": self.capture.to_dict() if self.capture else None,
+            "content_check": self.content_check.to_dict() if self.content_check else None,
             "analysis": self.analysis.to_dict(include_raw) if self.analysis else None,
         }
 
@@ -370,6 +472,31 @@ class ScanReport:
         return any(r.status_check is not None for r in self.results)
 
     @property
+    def evaluation_known(self) -> bool:
+        """True once the scanner has recorded a coverage state for any target."""
+        return any(r.evaluation for r in self.results)
+
+    def evaluation_counts(self) -> dict[str, int]:
+        counts = {state: 0 for state in EVALUATION_STATES}
+        for result in self.results:
+            if result.evaluation:
+                counts[result.evaluation] = counts.get(result.evaluation, 0) + 1
+        return counts
+
+    @property
+    def unevaluated(self) -> list[ScanResult]:
+        """Targets the run promised to look at and did not get through.
+
+        Results without a recorded state are left out: an unknown is not a
+        failure, and a hand-built report must not trip a coverage gate.
+        """
+        return [r for r in self.results if r.evaluation and not r.evaluated]
+
+    @property
+    def content_checked(self) -> bool:
+        return any(r.content_check is not None for r in self.results)
+
+    @property
     def status_failures(self) -> list[ScanResult]:
         return [r for r in self.results if r.status_check is not None and not r.status_check.ok]
 
@@ -385,6 +512,8 @@ class ScanReport:
             "severity_counts": self.severity_counts(),
             "status_counts": self.status_counts(),
             "status_code_counts": self.status_code_counts(),
+            "evaluation_counts": self.evaluation_counts(),
+            "unevaluated_count": len(self.unevaluated),
             "max_severity": self.max_severity.value,
             "results": [r.to_dict(include_raw) for r in self.results],
         }

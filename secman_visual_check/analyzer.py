@@ -101,20 +101,26 @@ class VisionAnalyzer:
         )
         image_url = _data_url(Path(capture.screenshot_path))
 
-        try:
-            payload, raw_text = await self._request(prompt, image_url)
-        except AnalyzerError:
-            raise
-        except Exception as exc:
-            return Analysis(
-                risk_level=Severity.INFO,
-                summary="Analysis failed.",
-                model=self.options.model,
-                error=f"{type(exc).__name__}: {exc}"[:400],
-                duration_s=time.monotonic() - started,
-            )
+        # An unparseable reply is retried once: the model answered, so the
+        # transport is fine, and a second sample usually is valid JSON. Without
+        # this a single garbled reply leaves a target unevaluated for the run.
+        for attempt in range(2):
+            try:
+                payload, raw_text = await self._request(prompt, image_url)
+            except AnalyzerError:
+                raise
+            except Exception as exc:
+                return Analysis(
+                    risk_level=Severity.INFO,
+                    summary="Analysis failed.",
+                    model=self.options.model,
+                    error=f"{type(exc).__name__}: {exc}"[:400],
+                    duration_s=time.monotonic() - started,
+                )
+            analysis = parse_analysis(raw_text, self.options.model)
+            if analysis.error is None or attempt == 1 or self.options.max_retries == 0:
+                break
 
-        analysis = parse_analysis(raw_text, self.options.model)
         analysis.duration_s = time.monotonic() - started
         usage = (payload or {}).get("usage") or {}
         analysis.prompt_tokens = usage.get("prompt_tokens")

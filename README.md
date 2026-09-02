@@ -185,6 +185,12 @@ outside in:
 | `--no-ai` | yes | yes | no | Chromium |
 | `--no-visual-check` | yes | no | no | neither |
 
+The content check runs in every mode: on the page text and DOM when the browser
+ran, on the raw response body when only the status check did. A `--no-ai` or
+`--no-visual-check` run therefore still produces findings for a leaked key, a
+served `.env` or a stack trace — deterministic ones, tagged
+`"source": "content"`.
+
 `--no-status-check` turns off the remaining probe; combining it with
 `--no-visual-check` leaves nothing to do and is rejected with exit code `2`.
 
@@ -429,6 +435,33 @@ python -m secman_visual_check \
   https://example.com
 ```
 
+### The content check — what the page *contains*
+
+The model judges what a page shows. A second, deterministic check judges what
+it contains: a fixed set of patterns is run over the rendered text, the DOM
+after scripts ran, and the raw response body the status check already
+downloaded, and every match becomes a finding tagged `"source": "content"`.
+It needs no model and no API key, is on by default, and is what still finds a
+private key in an HTML comment, a `DB_PASSWORD=` on line 900 of a page cut off
+by `--max-height`, or an AWS key on a `--no-ai` run.
+
+| Looks for | Category | Severity |
+| --- | --- | --- |
+| Private keys, AWS/GitHub/Slack/Stripe/Google keys, JWTs, connection strings and URLs with passwords | `exposed_credentials` | critical / high |
+| `.env` secrets, a served `.git/config` | `backup_or_source_disclosure` | critical / high |
+| `password = …` and `Bearer …` in visible text (guarded against labels and placeholders) | `exposed_credentials` | high |
+| IBANs and payment card numbers with valid check digits; bulk email lists | `personal_data` | high / medium |
+| Stack traces, Django debug pages, `phpinfo()`, Spring actuator dumps | `debug_output` | high |
+| `Index of /` listings | `directory_listing` | high |
+| Private IP addresses, server version banners | `infrastructure_disclosure` | medium / low |
+
+One finding per pattern per page, secrets redacted to four characters in the
+evidence, loose patterns restricted to visible text so minified scripts do not
+flood the report. Extend or replace the set with `--content-patterns-file`
+(see `examples/content-patterns.json`); turn it off with `--no-content-check`.
+Full pattern list, sources and file format in
+[docs/CONTENT_CHECK.md](docs/CONTENT_CHECK.md).
+
 ## Choosing a model
 
 Any vision-capable model on an OpenAI-compatible endpoint works. The default is
@@ -495,6 +528,19 @@ python -m secman_visual_check -f targets.txt --fail-on critical --quiet
 
 Use `--fail-on none` to always exit `0`, and `--dry-run -q` to print the
 resolved, de-duplicated target list without touching the network.
+
+`--fail-on` answers "was anything found". `--fail-on-unevaluated` answers the
+other question a gate needs: "was every target actually looked at". Every
+result records an `evaluation` state — `analysed`, `captured`, `status_only`
+for a target that got through every stage the run asked for; `analysis_failed`,
+`capture_failed`, `skipped`, `error` for one that did not — and the flag exits
+`1` when any target is in the second group. The console, JSON, CSV, HTML and
+statistics reports all carry the state, and unevaluated targets are listed with
+the reason. See [docs/COVERAGE.md](docs/COVERAGE.md).
+
+```bash
+python -m secman_visual_check -f targets.txt --fail-on high --fail-on-unevaluated --quiet
+```
 
 ## Dry runs
 
@@ -691,6 +737,8 @@ troubleshooting: [docs/SECMAN_UPLOAD.md](docs/SECMAN_UPLOAD.md).
 | `--no-json`, `--no-html`, `--no-csv`, `--no-stats` | Drop one of the four default reports. `--json/--html/--csv/--stats PATH` relocate them. |
 | `--link-images` | Link screenshots from the HTML report instead of embedding them, for large scans. |
 | `--include-raw` | Keep the raw model replies in the JSON report, for debugging prompts. |
+| `--no-content-check`, `--content-patterns-file PATH`, `--content-max-chars N` | The deterministic pattern check of page text, DOM and raw body for credentials, personal data and debug output: turn it off, extend or replace its patterns, cap how much content it reads. See [docs/CONTENT_CHECK.md](docs/CONTENT_CHECK.md). |
+| `--fail-on-unevaluated` | Exit 1 when any target did not get through every stage the run asked for. See [docs/COVERAGE.md](docs/COVERAGE.md). |
 | `--no-visual-check` | Skip the browser entirely: no screenshots, no model calls, no Chromium needed. |
 | `--no-status-check` | Skip the HTTP status/redirect pre-check. |
 | `--no-status-checksum`, `--status-checksum-max-bytes` | Body hashing of healthy targets is on by default; turn it off, or cap how much of a body is read. |
@@ -716,10 +764,15 @@ Full list: `python -m secman_visual_check --help`.
   "status_counts": {"ok": 1, "redirect": 1, "redirect_broken": 0,
                     "unexpected_status": 0, "client_error": 0, "server_error": 0,
                     "unreachable": 0, "unknown": 0},
+  "evaluation_counts": {"analysed": 2, "analysis_failed": 0, "captured": 0, "capture_failed": 0,
+                        "status_only": 0, "skipped": 0, "error": 0},
+  "unevaluated_count": 0,
   "max_severity": "critical",
   "results": [
     {
       "url": "https://example.com/backup/",
+      "evaluation": "analysed",
+      "evaluated": true,
       "max_severity": "critical",
       "status_check": {
         "state": "ok",
@@ -741,6 +794,8 @@ Full list: `python -m secman_visual_check --help`.
         "checked_at": "2026-07-29T09:14:02.113000+00:00"
       },
       "capture": {"status": 200, "title": "Index of /backup", "screenshot_path": "..."},
+      "content_check": {"sources": ["text", "html", "body"], "chars_scanned": 3812,
+                        "matches": 1, "findings": 1},
       "analysis": {
         "risk_level": "critical",
         "page_type": "directory listing",
@@ -752,7 +807,17 @@ Full list: `python -m secman_visual_check --help`.
             "title": "Database password rendered in page",
             "evidence": "DB_PASSWORD=hunt...",
             "recommendation": "Rotate the credential and remove the file.",
-            "confidence": 0.9
+            "confidence": 0.9,
+            "source": "model"
+          },
+          {
+            "category": "backup_or_source_disclosure",
+            "severity": "critical",
+            "title": "Environment file secret rendered in page",
+            "evidence": "DB_PASSWORD=hunt… — in page text",
+            "recommendation": "Block access to .env and similar files at the web server, then rotate every value in it.",
+            "confidence": 0.9,
+            "source": "content"
           }
         ]
       }
@@ -767,6 +832,13 @@ depend on it. A page that only rendered the browser's own error screen is never
 sent to the model. `status_check` is `null` when the check is disabled or the
 target was skipped by `robots.txt`.
 
+`evaluation` says how far each target got through the stages the run asked for
+and `evaluated` whether it got through all of them ([docs/COVERAGE.md](docs/COVERAGE.md)).
+`content_check` records what the pattern check searched, even when nothing
+matched; its findings sit beside the model's with `"source": "content"`
+([docs/CONTENT_CHECK.md](docs/CONTENT_CHECK.md)). `content_check` is `null`
+when the check is off or no stage produced content for the target.
+
 ## How it fits together
 
 | Module | Responsibility |
@@ -777,7 +849,8 @@ target was skipped by `robots.txt`.
 | `categories.py` | The policy — what counts as critical content |
 | `prompts.py` | System prompt, user prompt, and the response JSON schema |
 | `analyzer.py` | OpenAI-compatible vision call, retries, lenient JSON parsing |
-| `scanner.py` | Pipelines capture → analysis with independent concurrency limits |
+| `content.py` | Deterministic pattern check of page text, DOM and raw body for confidential data |
+| `scanner.py` | Pipelines capture → analysis → content check with independent concurrency limits; records each target's evaluation state |
 | `reporting.py` | Console, JSON, HTML, CSV and statistics output |
 | `secman.py` | Maps findings onto SecMan vulnerabilities; HTTP and MCP upload |
 | `db.py` | Optional MariaDB mirror: status history, URL flags, change tracking |
@@ -788,8 +861,12 @@ target was skipped by `robots.txt`.
 
 ## Caveats
 
-- The model reads a screenshot. It can miss content below the `--max-height`
-  clamp, behind a click, or rendered after `--settle` elapses.
+- The model reads a screenshot. It can miss content behind a click or rendered
+  after `--settle` elapses. Content below the `--max-height` clamp and text the
+  browser never paints — comments, scripts — are covered by the content check,
+  which is pattern matching and carries its own confidence values.
+- A target the run could not evaluate is reported as such, not as clean. Gate on
+  `--fail-on-unevaluated` when the list is the promise.
 - Verdicts are probabilistic. Treat findings as a triage queue, not a control.
   Every finding carries a `confidence`; the evidence string tells you what the
   model actually saw.
@@ -805,8 +882,9 @@ python -m pytest
 
 The suite covers URL handling, prompt construction, the model-response parser,
 the analyzer's HTTP behaviour (retries, schema downgrade, auth failures) against
-a mocked transport, scanner orchestration, report rendering, and the SecMan
-upload — ID stability, the three de-duplication layers, dry-run behaviour, and
+a mocked transport, scanner orchestration and per-target coverage accounting,
+the content check's patterns and their false-positive guards, report rendering,
+and the SecMan upload — ID stability, the three de-duplication layers, dry-run behaviour, and
 both transports against a mocked backend. `pass://` resolution is covered on
 both sides — the Python resolver against a fake `pass-cli`, and
 `scripts/passcli.sh` through bash against a stub binary — and `--dry-run` is

@@ -177,3 +177,42 @@ def test_mode_downgrade_helpers():
     assert _lower_mode("none", "json_object") == "none"
     assert _is_response_format_error("Unsupported response_format")
     assert not _is_response_format_error("context length exceeded")
+
+
+def test_an_unparseable_reply_is_retried_once(screenshot):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, json=completion("I cannot answer in JSON, sorry."))
+        return httpx.Response(200, json=completion(json.dumps(VERDICT)))
+
+    analysis, _ = run_analysis(handler, screenshot)
+    assert len(calls) == 2
+    assert analysis.error is None
+    assert analysis.risk_level is Severity.HIGH
+
+
+def test_a_second_unparseable_reply_is_recorded_not_retried_forever(screenshot):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=completion("still prose"))
+
+    analysis, _ = run_analysis(handler, screenshot)
+    assert len(calls) == 2
+    assert analysis.error == "could not parse JSON from model response"
+
+
+def test_parse_retry_is_off_when_retries_are_disabled(screenshot):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=completion("prose"))
+
+    analysis, _ = run_analysis(handler, screenshot, max_retries=0)
+    assert len(calls) == 1
+    assert analysis.error
