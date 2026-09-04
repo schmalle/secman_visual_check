@@ -1239,10 +1239,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
     except AnalyzerError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        # AnalyzerError messages embed the vision provider's own response
+        # text (see analyzer._request: "Provider rejected the API key
+        # (401): {_error_text(response)}"). --base-url is operator-supplied
+        # but can point at any OpenAI-compatible endpoint, and a malicious
+        # or misconfigured one can echo the Authorization header it
+        # received back in an error body — the same "backend quotes a
+        # credential back" threat every other output sink in this file
+        # (_emit, _run_secman_upload, _progress_hook) already redacts
+        # against. This is a fatal, run-aborting error printed straight to
+        # stderr, so it needs the same scrubbing.
+        print(f"error: {redact(str(exc), resolver.values)}", file=sys.stderr)
         return EXIT_ERROR
     except RuntimeError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {redact(str(exc), resolver.values)}", file=sys.stderr)
         return EXIT_ERROR
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
