@@ -2,8 +2,10 @@ import json
 
 import pytest
 
+from secman_visual_check.analyzer import AnalyzerError
 from secman_visual_check.categories import DEFAULT_CATEGORIES, load_categories
 from secman_visual_check.cli import (
+    EXIT_ERROR,
     _progress_hook,
     build_config,
     build_db_options,
@@ -495,6 +497,45 @@ def _stub_scan(monkeypatch):
         return report
 
     monkeypatch.setattr("secman_visual_check.cli.run_scan", fake_run_scan)
+
+
+def test_analyzer_error_is_redacted_before_it_reaches_stderr(tmp_path, monkeypatch, capsys):
+    # analyzer.AnalyzerError embeds the vision provider's own response text
+    # (e.g. "Provider rejected the API key (401): {_error_text(response)}").
+    # --base-url is operator-supplied but can point at any OpenAI-compatible
+    # endpoint, and a malicious or misconfigured one can echo the
+    # Authorization header it received back in that error body — the same
+    # "backend quotes a credential back" threat every other output sink in
+    # cli.py (_emit, _run_secman_upload, _progress_hook) already redacts
+    # against. This is main()'s fatal, run-aborting AnalyzerError handler,
+    # printed straight to stderr, so a resolved --api-key reflected back
+    # this way must not reach it in the clear.
+    secret = "sk-resolved-from-pass-cli"
+    stub = tmp_path / "fake-pass-cli"
+    stub.write_text(f"#!/bin/sh\nprintf '{secret}\\n'\n", encoding="utf-8")
+    stub.chmod(0o755)
+
+    async def fake_run_scan(targets, config, progress=None, tool_version=""):
+        raise AnalyzerError(f"Provider rejected the API key (401): key {secret} rejected")
+
+    monkeypatch.setattr("secman_visual_check.cli.run_scan", fake_run_scan)
+
+    code = main(
+        [
+            "https://example.com",
+            "-o",
+            str(tmp_path / "out"),
+            "--pass-cli-binary",
+            str(stub),
+            "--api-key",
+            "pass://Infra/OpenRouter/key",
+        ]
+    )
+
+    err = capsys.readouterr().err
+    assert code == EXIT_ERROR
+    assert secret not in err
+    assert "<redacted>" in err
 
 
 def test_all_four_reports_are_written_by_default(tmp_path, monkeypatch):
